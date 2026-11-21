@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### 修复
+
+- **成功回合不再只押 finalize 帧**：`observe(kind="end")` 在成功回合延迟 1 秒兜底收尾，帧未到也能封卡；`Turn` 增加 `finishing` 互斥，避免观察钩子与 finalize 帧同时封卡抢 CardKit seq（#120）。
+- **收尾期间的帧不再被误判为投递失败**：卡片已建好时，`frame()` 在 `closing` 状态向宿主返回成功，避免宿主判定流式失败后把整条回复退回原生发送，造成“卡片 + 重复文本”和 Reasoning 代码块重复出现。
+
 ## [0.14.0] - 2026-11-02
 
 ### 变更

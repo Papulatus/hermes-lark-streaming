@@ -328,3 +328,62 @@ async def test_sequence_recovery_is_bounded_and_only_handles_conflicts(controlle
     assert error.value.code == code
     assert operation.await_count == attempts
     assert len({c.kwargs["request_id"] for c in operation.await_args_list}) == 1
+
+
+@pytest.mark.asyncio
+async def test_frame_while_closing_acknowledges_existing_card(controller):
+    """收尾期间到达的帧必须确认成功，否则宿主会整条退回原生发送（#120）."""
+    await controller.frame("t", "chat", "answer", reply_to="in", source_id="in")
+    turn = controller.turns["t"]
+    turn.closing = True
+    assert await controller.frame("t", "chat", "answer", reply_to="in", source_id="in", finalize=True)
+
+
+@pytest.mark.asyncio
+async def test_frame_while_closing_without_card_does_not_ack(controller):
+    """卡没建成功时必须返回失败，让宿主的原生兜底还能发出答案."""
+    await controller.frame("t", "chat", "answer", reply_to="in", source_id="in")
+    turn = controller.turns["t"]
+    turn.closing = True
+    turn.session.card_id = None
+    turn.session.card_msg_id = None
+    assert not await controller.frame("t", "chat", "answer", reply_to="in", source_id="in", finalize=True)
+
+
+@pytest.mark.asyncio
+async def test_grace_finish_closes_unfinished_turn(controller, monkeypatch):
+    await controller.frame("t", "chat", "answer", reply_to="in", source_id="in")
+    turn = controller.turns["t"]
+    calls = []
+
+    async def fake_finish(key, turn, **kwargs):
+        calls.append(key)
+        return True
+
+    monkeypatch.setattr(controller, "_finish_locked", fake_finish)
+    await controller._finish_after_grace("t", turn, delay=0)
+    assert calls == ["t"]
+
+
+@pytest.mark.asyncio
+async def test_grace_finish_skips_already_closing_turn(controller, monkeypatch):
+    await controller.frame("t", "chat", "answer", reply_to="in", source_id="in")
+    turn = controller.turns["t"]
+    turn.closing = True
+    calls = []
+
+    async def fake_finish(key, turn, **kwargs):
+        calls.append(key)
+        return True
+
+    monkeypatch.setattr(controller, "_finish_locked", fake_finish)
+    await controller._finish_after_grace("t", turn, delay=0)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_finish_locked_is_idempotent(controller):
+    await controller.frame("t", "chat", "answer", reply_to="in", source_id="in")
+    turn = controller.turns["t"]
+    turn.finishing = True
+    assert not await controller._finish_locked("t", turn)
