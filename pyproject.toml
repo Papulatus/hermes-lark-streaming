@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermes-lark-streaming"
+name = "hermes-lark-streaming-cards"
 version = "0.14.0"
 description = "Real-time streaming card plugin for Hermes Gateway via Feishu/Lark CardKit v2.0"
 readme = "README.md"
