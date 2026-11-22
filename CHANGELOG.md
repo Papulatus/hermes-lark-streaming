@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **独立平台身份 `feishu-streaming`**：不再复用内置 `feishu` 平台注册，避免两者同时注册时内置适配器胜出、回答永远走原生消息（卡片只剩过程面板）。与 Aowen 版采用同样的平台隔离方式，但保留本插件的增量流式渲染。迁移需关闭 `platforms.feishu`、启用 `platforms.feishu-streaming`，并把 cron 投递目标改为 `feishu-streaming:<chat_id>`；会话键会变，旧线程不续。
+
 ## [0.14.0] - 2026-11-02
 
 ### 变更

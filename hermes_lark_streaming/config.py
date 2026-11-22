@@ -11,6 +11,9 @@ import yaml
 DEFAULT_DOMAIN = "https://open.feishu.cn"  # SDK 根域名，Larksuite 用 https://open.larksuite.com
 LARK_DOMAIN = "https://open.larksuite.com"
 
+# 平台身份：用独立名字，避免和内置 feishu 平台抢注册（同 Aowen 的做法）
+PLATFORM = "feishu-streaming"
+
 
 def hermes_home() -> Path:
     """Hermes 主目录，优先级 HERMES_HOME 环境变量 → ~/.hermes."""
@@ -56,9 +59,10 @@ class Config:
             return False
         platforms = display.get("platforms")
         if isinstance(platforms, dict):
-            feishu = platforms.get("feishu")
-            if isinstance(feishu, dict) and "show_reasoning" in feishu:
-                return bool(feishu["show_reasoning"])
+            for name in (PLATFORM, "feishu"):
+                feishu = platforms.get(name)
+                if isinstance(feishu, dict) and "show_reasoning" in feishu:
+                    return bool(feishu["show_reasoning"])
         return bool(display.get("show_reasoning", False))
 
     @property
@@ -73,9 +77,10 @@ class Config:
             return True
         platforms = display.get("platforms")
         if isinstance(platforms, dict):
-            feishu = platforms.get("feishu")
-            if isinstance(feishu, dict) and "show_tool_use" in feishu:
-                return bool(feishu["show_tool_use"])
+            for name in (PLATFORM, "feishu"):
+                feishu = platforms.get(name)
+                if isinstance(feishu, dict) and "show_tool_use" in feishu:
+                    return bool(feishu["show_tool_use"])
         return bool(display.get("show_tool_use", True))
 
     @property

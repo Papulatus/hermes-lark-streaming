@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-PLATFORM = "feishu"
+from .config import PLATFORM
 
 
 def check_host() -> None:
