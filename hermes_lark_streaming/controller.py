@@ -29,6 +29,7 @@ class Turn:
     source_id: str
     text: str = ""
     closing: bool = False
+    finishing: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tools: dict[str, ToolStep] = field(default_factory=dict)
     observer_turn_id: str = ""
@@ -45,6 +46,7 @@ class StreamCardController(StreamingController):
         self.turns: dict[str, Turn] = {}
         self._finished: OrderedDict[str, tuple[bool, bool]] = OrderedDict()
         self._pending_tools: OrderedDict[int, Turn] = OrderedDict()
+        self._grace_tasks: set[asyncio.Task] = set()
 
     def _cleanup_session(self, session: CardSession) -> None:
         session.flush.mark_completed()
@@ -76,7 +78,9 @@ class StreamCardController(StreamingController):
             turn = self.turns[key] = Turn(session, source_id)
         async with turn.lock:
             if turn.closing:
-                return self._finished.get(key, (False, False))[0]
+                # 收尾中：卡片已建好就向宿主确认成功，避免它判定投递失败后
+                # 把整条回复退回原生发送，造成“卡片 + 重复文本”。
+                return bool(turn.session.has_card and turn.session.state != SessionState.FAILED)
             session = turn.session
             if session.state == SessionState.IDLE:
                 await self._do_create_card(session)
@@ -131,7 +135,23 @@ class StreamCardController(StreamingController):
                 session.segment_state.on_answer_delta(text)
         turn.text = text
 
+    async def _finish_after_grace(self, key: str, turn: Turn, delay: float = 1.0) -> None:
+        """成功回合的兜底收尾：给 finalize 帧一秒先到，没到就自己封卡."""
+        try:
+            await asyncio.sleep(delay)
+            async with turn.lock:
+                if turn.closing or key not in self.turns:
+                    return
+                await self._finish_locked(key, turn)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _logger.exception("Delayed card completion failed")
+
     async def _finish_locked(self, key: str, turn: Turn, *, aborted: bool = False, failed: bool = False) -> bool:
+        if turn.finishing:
+            return False
+        turn.finishing = True
         turn.closing = True
         session = turn.session
         session.footer.setdefault("duration", time.time() - session.created_at)
@@ -199,6 +219,12 @@ class StreamCardController(StreamingController):
                         aborted=bool(payload.get("interrupted")),
                         failed=not payload.get("interrupted"),
                     )
+                else:
+                    # 成功回合：先给 finalize 帧一秒，没到就兜底收尾。
+                    # 只依赖 finalize 帧会让卡片停在流式态（#120）。
+                    task = asyncio.create_task(self._finish_after_grace(key, turn))
+                    self._grace_tasks.add(task)
+                    task.add_done_callback(self._grace_tasks.discard)
                 return
             if session.state.is_terminal:
                 return
