@@ -8,13 +8,13 @@ import weakref
 from collections import OrderedDict
 from typing import Any
 
-from gateway.config import StreamingConfig
+from gateway.config import Platform, StreamingConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session_context import get_session_env
 from plugins.platforms.feishu import adapter as builtin
 
 from .cardkit.builder import build_static_card
-from .config import DEFAULT_DOMAIN, LARK_DOMAIN, Config, hermes_home
+from .config import DEFAULT_DOMAIN, LARK_DOMAIN, PLATFORM, Config, hermes_home
 from .controller import StreamCardController
 from .feishu import FeishuClient, FeishuClientConfig
 
@@ -28,6 +28,10 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
 
     def __init__(self, config: Any) -> None:
         super().__init__(config)
+        # 内置 FeishuAdapter 在 super().__init__ 里把平台写死成 Platform.FEISHU；
+        # 本插件注册成独立平台，必须改回自己的身份，否则入站事件会被判成
+        # feishu 平台、在 session authority 里找不到绑定（AuthorityRefusal: not_found）。
+        self.platform = Platform(PLATFORM)
         self.cards = StreamCardController(
             Config(hermes_home(), extra=config.extra),
             FeishuClient(
