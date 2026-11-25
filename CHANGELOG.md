@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### 新增
+### 修复
 
-- **独立平台身份 `feishu-streaming`**：不再复用内置 `feishu` 平台注册，避免两者同时注册时内置适配器胜出、回答永远走原生消息（卡片只剩过程面板）。与 Aowen 版采用同样的平台隔离方式，但保留本插件的增量流式渲染。迁移需关闭 `platforms.feishu`、启用 `platforms.feishu-streaming`，并把 cron 投递目标改为 `feishu-streaming:<chat_id>`；会话键会变，旧线程不续。
+- 恢复 `feishu` 注册，沿用内置适配器的凭据、权限与投递路由。
+- 流式卡片收尾后向 Hermes 返回飞书消息 ID。终稿修正和重试据此更新同一卡片，连续回复与排队回复按入站消息 ID 分别投递。
+- CardKit 回复绕过内置富文本的 8,000 字符分段限制，完成态保留完整正文。
 
 ## [0.14.0] - 2026-11-02
 

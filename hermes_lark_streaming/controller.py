@@ -12,6 +12,7 @@ from typing import Any
 
 from agent.i18n import get_language, t
 
+from .cardkit.builder import build_static_card
 from .cardkit.i18n import _t
 from .config import Config
 from .feishu import FeishuClient
@@ -29,7 +30,8 @@ class Turn:
     source_id: str
     text: str = ""
     closing: bool = False
-    finishing: bool = False
+    final_text: str | None = None
+    aborted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tools: dict[str, ToolStep] = field(default_factory=dict)
     observer_turn_id: str = ""
@@ -44,9 +46,8 @@ class StreamCardController(StreamingController):
         self._cfg = config
         self._client = client
         self.turns: dict[str, Turn] = {}
-        self._finished: OrderedDict[str, tuple[bool, bool]] = OrderedDict()
+        self._retired: OrderedDict[str, Turn] = OrderedDict()
         self._pending_tools: OrderedDict[int, Turn] = OrderedDict()
-        self._grace_tasks: set[asyncio.Task] = set()
 
     def _cleanup_session(self, session: CardSession) -> None:
         session.flush.mark_completed()
@@ -65,45 +66,86 @@ class StreamCardController(StreamingController):
         session_key: str = "",
     ) -> bool:
         """消费累计正文；只有成功落地才向宿主确认投递."""
-        if key in self._finished:
-            if not text and not finalize and self._finished[key][1]:
-                del self._finished[key]  # 宿主在审批边界后显式重新开流
-            else:
-                return self._finished[key][0]
-        turn = self.turns.get(key)
+        turn = self._retired.get(key) or self.turns.get(key)
         if turn is None:
             session = CardSession(source_id, chat_id, asyncio.get_running_loop())
             session.session_key = session_key
             session.anchor_id = reply_to
             turn = self.turns[key] = Turn(session, source_id)
         async with turn.lock:
-            if turn.closing:
-                # 收尾中：卡片已建好就向宿主确认成功，避免它判定投递失败后
-                # 把整条回复退回原生发送，造成“卡片 + 重复文本”。
-                return bool(turn.session.has_card and turn.session.state != SessionState.FAILED)
             session = turn.session
+            if session.chat_id != chat_id:
+                return False
+            if finalize and session.card_msg_id:
+                return await self._deliver_locked(key, turn, text)
+            if turn.closing:
+                return False
             if session.state == SessionState.IDLE:
                 await self._do_create_card(session)
-            if session.guard.should_skip("frame"):
-                self._retire(key, True)
-                return True
-            if not session.has_card or session.state == SessionState.FAILED:
-                self._retire(key, False)
+            if session.guard.should_skip("frame") or not session.has_card or session.state == SessionState.FAILED:
+                self._retire(key, turn)
                 return False
+            if finalize:
+                return await self._deliver_locked(key, turn, text)
             if text != turn.text:
-                is_clarify_prompt = (
-                    finalize and not turn.text
-                    and text == t("gateway.clarify.native_stream_placeholder")
-                    and any(s.name == "clarify" and s.status == ToolStatus.RUNNING for s in turn.tools.values())
-                )
                 self._replace_text(turn, text)
-                if is_clarify_prompt:
-                    # 仅绑定宿主在空正文边界补入的提示，不替换模型正文
-                    turn.clarify_prompt = session.segment_state.segments[-1]
                 self._schedule_flush(session)
-            if not finalize:
+            return True
+
+    def _turn(self, key: str, chat_id: str) -> Turn | None:
+        turn = self.turns.get(key) or self._retired.get(key)
+        return turn if turn and turn.session.chat_id == chat_id else None
+
+    def message_id(self, key: str, chat_id: str) -> str | None:
+        turn = self._turn(key, chat_id)
+        return turn.session.card_msg_id if turn else None
+
+    def source_for_message(self, message_id: str, chat_id: str) -> str | None:
+        for turns in (self.turns, self._retired):
+            for key, turn in turns.items():
+                if turn.session.card_msg_id == message_id and turn.session.chat_id == chat_id:
+                    return key
+        return None
+
+    async def deliver(self, key: str, chat_id: str, text: str) -> bool:
+        turn = self._turn(key, chat_id)
+        if not turn:
+            return False
+        async with turn.lock:
+            if turn.aborted or self._client is None:
+                return False
+            if await self._deliver_locked(key, turn, text):
                 return True
-            return await self._finish_locked(key, turn)
+            message_id = turn.session.card_msg_id
+            if not message_id:
+                return False
+            # CardKit and IM address different IDs. If the entity update fails,
+            # try replacing the contents of the original message under the same lock.
+            try:
+                await self._client.update_card_message(message_id, build_static_card(text))
+            except Exception:
+                _logger.warning("Could not update streamed message %s", message_id, exc_info=True)
+                return False
+            turn.final_text = text
+            return True
+
+    async def _deliver_locked(self, key: str, turn: Turn, text: str) -> bool:
+        if not turn.session.card_msg_id or turn.aborted:
+            return False
+        if turn.final_text == text:
+            return True
+        if text != turn.text:
+            is_clarify_prompt = (
+                not turn.text and text == t("gateway.clarify.native_stream_placeholder")
+                and any(step.name == "clarify" and step.status == ToolStatus.RUNNING for step in turn.tools.values())
+            )
+            self._replace_text(turn, text)
+            if is_clarify_prompt:
+                turn.clarify_prompt = turn.session.segment_state.segments[-1]
+        if not await self._finish_locked(key, turn):
+            return False
+        turn.final_text = text
+        return True
 
     async def interim(self, source_id: str, text: str) -> str | None:
         matches = self.find_source(source_id)
@@ -135,48 +177,32 @@ class StreamCardController(StreamingController):
                 session.segment_state.on_answer_delta(text)
         turn.text = text
 
-    async def _finish_after_grace(self, key: str, turn: Turn, delay: float = 1.0) -> None:
-        """成功回合的兜底收尾：给 finalize 帧一秒先到，没到就自己封卡."""
-        try:
-            await asyncio.sleep(delay)
-            async with turn.lock:
-                if turn.closing or key not in self.turns:
-                    return
-                await self._finish_locked(key, turn)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _logger.exception("Delayed card completion failed")
-
     async def _finish_locked(self, key: str, turn: Turn, *, aborted: bool = False, failed: bool = False) -> bool:
-        if turn.finishing:
-            return False
-        turn.finishing = True
         turn.closing = True
         session = turn.session
         session.footer.setdefault("duration", time.time() - session.created_at)
         if aborted or failed:
+            turn.aborted = aborted
             session.state = SessionState.ABORTED if aborted else SessionState.FAILED
         try:
-            success = await self._do_complete_card(session)
+            success = bool(session.card_msg_id) and await self._do_complete_card(session)
         except Exception:
             _logger.exception("Card completion failed")
             success = False
-        if success and not (aborted or failed) and any(s.status == ToolStatus.RUNNING for s in turn.tools.values()):
-            # clarify / 审批先封卡，工具结果稍后才到；仍需更新原卡片
+        finally:
+            self._retire(key, turn)
+        if success and any(s.status == ToolStatus.RUNNING for s in turn.tools.values()):
             self._pending_tools[id(turn)] = turn
             while len(self._pending_tools) > 256:
                 self._pending_tools.popitem(last=False)
-        self._retire(key, success, allow_reopen=not (aborted or failed))
         return success
 
-    def _retire(self, key: str, success: bool, *, allow_reopen: bool = False) -> None:
-        turn = self.turns.pop(key, None)
-        if turn:
-            self._cleanup_session(turn.session)
-        self._finished[key] = (success, allow_reopen)
-        while len(self._finished) > 256:
-            self._finished.popitem(last=False)
+    def _retire(self, key: str, turn: Turn) -> None:
+        self.turns.pop(key, None)
+        self._cleanup_session(turn.session)
+        self._retired[key] = turn
+        while len(self._retired) > 256:
+            self._retired.popitem(last=False)
 
     def find_source(self, source_id: str) -> list[tuple[str, Turn]]:
         return [(key, turn) for key, turn in self.turns.items() if turn.source_id == source_id and not turn.closing]
@@ -219,12 +245,6 @@ class StreamCardController(StreamingController):
                         aborted=bool(payload.get("interrupted")),
                         failed=not payload.get("interrupted"),
                     )
-                else:
-                    # 成功回合：先给 finalize 帧一秒，没到就兜底收尾。
-                    # 只依赖 finalize 帧会让卡片停在流式态（#120）。
-                    task = asyncio.create_task(self._finish_after_grace(key, turn))
-                    self._grace_tasks.add(task)
-                    task.add_done_callback(self._grace_tasks.discard)
                 return
             if session.state.is_terminal:
                 return
@@ -322,11 +342,13 @@ class StreamCardController(StreamingController):
                     ):
                         seg.dirty = True
 
-    async def close_source(self, source_id: str) -> None:
+    async def close_source(self, source_id: str, *, aborted: bool = True, failed: bool = False) -> bool:
+        closed = False
         for key, turn in self.find_source(source_id):
             async with turn.lock:
                 if not turn.closing:
-                    await self._finish_locked(key, turn, aborted=True)
+                    closed = await self._finish_locked(key, turn, aborted=aborted, failed=failed)
+        return closed
 
     async def close(self) -> None:
         for source_id in {turn.source_id for turn in self.turns.values()}:

@@ -19,19 +19,20 @@ def _dispatch(kind: str, payload: dict[str, Any]) -> None:
     if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
         return
     # 入站 ID 由官方 contextvars 随观察事件传递，不使用模型 turn_id 匹配 Gateway UUID
-    source_id = get_session_env("HERMES_SESSION_MESSAGE_ID")
-    if not source_id:
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+    if not chat_id:
         return
     home = get_hermes_home().resolve()
     for adapter in list(ACTIVE):
         if adapter.cards._cfg._home != home:
             continue
+        source_id = adapter.processing_source_id(chat_id)
         loop = adapter._card_loop
-        if loop is None or loop.is_closed():
+        if not source_id or loop is None or loop.is_closed():
             continue
 
-        def schedule(target: Any = adapter) -> None:
-            task = asyncio.create_task(target.cards.observe(source_id, kind, payload))
+        def schedule(target: Any = adapter, inbound_id: str = source_id) -> None:
+            task = asyncio.create_task(target.observe_card(inbound_id, chat_id, kind, payload))
             task.add_done_callback(_report)
 
         loop.call_soon_threadsafe(schedule)

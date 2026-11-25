@@ -45,28 +45,15 @@ def register(ctx: Any) -> None:
     )
     from .sender import standalone_send
 
-    def configured(config: Any) -> bool:
-        settings = builtin.FeishuAdapter._load_settings(config.extra or {})
-        return bool(settings.app_id and settings.app_secret)
+    def register_adapter(**entry: Any) -> None:
+        # Reuse the current built-in registration, including setup, env bridging,
+        # target validation and authorization. Only presentation and offline send differ.
+        entry.update(name=PLATFORM, adapter_factory=FeishuStreamingAdapter, standalone_sender_fn=standalone_send)
+        ctx.register_platform(**entry)
 
-    ctx.register_platform(
-        name=PLATFORM,
-        label="Feishu / Lark Streaming Cards",
-        adapter_factory=FeishuStreamingAdapter,
-        check_fn=builtin.feishu_deps_present,
-        ensure_deps_fn=builtin.check_feishu_requirements,
-        validate_config=configured,
-        is_connected=configured,
-        required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-        allowed_users_env="FEISHU_ALLOWED_USERS",
-        allow_all_env="FEISHU_ALLOW_ALL_USERS",
-        setup_fn=builtin.interactive_setup,
-        apply_yaml_config_fn=builtin._apply_yaml_config,
-        cron_deliver_env_var="FEISHU_HOME_CHANNEL",
-        standalone_sender_fn=standalone_send,
-        max_message_length=8000,
-        emoji="🪽",
-    )
+    from types import SimpleNamespace
+
+    builtin.register(SimpleNamespace(register_platform=register_adapter))
     for name, callback in (
         ("on_stream_start", observe_start),
         ("on_stream_delta", observe_reasoning),

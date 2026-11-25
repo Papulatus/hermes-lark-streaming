@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("gateway.stream_consumer", reason="Requires a Hermes >= 0.22.0 checkout")
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, SendResult
+from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.session import SessionSource
 from gateway.session_context import reset_session_vars, set_session_vars
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
@@ -66,7 +66,7 @@ async def test_real_consumer_stream_and_final(adapter):
     consumer = GatewayStreamConsumer(
         adapter,
         "chat",
-        config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor=""),
+        config=StreamConsumerConfig(transport="auto", edit_interval=0.01, buffer_threshold=1, cursor=""),
         initial_reply_to_id="incoming",
     )
     task = asyncio.create_task(consumer.run())
@@ -87,7 +87,7 @@ async def test_real_consumer_failed_card_uses_static_fallback(adapter):
     consumer = GatewayStreamConsumer(
         adapter,
         "chat",
-        config=StreamConsumerConfig(edit_interval=0.01, cursor=""),
+        config=StreamConsumerConfig(transport="auto", edit_interval=0.01, cursor=""),
         initial_reply_to_id="in",
     )
     consumer.on_delta("answer")
@@ -108,8 +108,9 @@ async def test_quoted_reply_keeps_inbound_identity(adapter):
     with patch.object(builtin.FeishuAdapter, "handle_message", new=AsyncMock()):
         await adapter.handle_message(event)
     set_session_vars(platform="feishu", chat_id="chat", message_id="incoming", session_key="s")
-    await adapter.send_stream_frame("", chat_id="chat", reply_to="quoted", turn_id="gateway-uuid")
-    turn = adapter.cards.turns["gateway-uuid"]
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "", metadata={"reply_to_message_id": "quoted"})
+    turn = adapter.cards.turns["incoming"]
     assert turn.source_id == "incoming"
     adapter.cards._client.reply_card_by_id.assert_awaited_with("quoted", "card-id")
     await adapter.interrupt_session_activity("s", "chat")
@@ -118,14 +119,40 @@ async def test_quoted_reply_keeps_inbound_identity(adapter):
 
 @pytest.mark.asyncio
 async def test_observer_threads_use_original_message_context(adapter, tmp_path):
+    adapter.cards._cfg._home = tmp_path
     (tmp_path / "config.yaml").write_text("display:\n  show_reasoning: true\n")
     set_session_vars(platform="feishu", chat_id="chat", message_id="incoming")
-    await adapter.send_stream_frame("", chat_id="chat", reply_to="incoming", turn_id="gateway-id")
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "", metadata={"reply_to_message_id": "incoming"})
     await asyncio.to_thread(observe_start, turn_id="agent-id")
     await asyncio.to_thread(observe_reasoning, turn_id="agent-id", kind="reasoning", delta="思考")
     await asyncio.sleep(0)
-    assert adapter.cards.turns["gateway-id"].session.segment_state.segments[0].text == "思考"
+    assert adapter.cards.turns["incoming"].session.segment_state.segments[0].text == "思考"
     await adapter.cards.close()
+
+
+@pytest.mark.asyncio
+async def test_reasoning_arriving_before_consumer_start_updates_original_card(adapter, tmp_path):
+    adapter.cards._cfg._home = tmp_path
+    (tmp_path / "config.yaml").write_text("display:\n  show_reasoning: true\n")
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u")
+    event = MessageEvent(text="question", source=source, message_id="incoming")
+    await adapter.on_processing_start(event)
+    await adapter.observe_card("incoming", "chat", "start", {"turn_id": "agent-id"})
+    await adapter.observe_card("incoming", "chat", "reasoning", {"turn_id": "agent-id", "delta": "思考"})
+    client = adapter.cards._client
+    client.cardkit_create.assert_not_awaited()
+
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "preview", {"reply_to_message_id": "incoming"})
+    result = await adapter.send("chat", "complete answer", metadata={"notify": True})
+    assert result.success and result.message_id == "message-id"
+    client.reply_card_by_id.assert_awaited_once_with("incoming", "card-id")
+    card = client.cardkit_update.call_args.args[1]
+    panel, answer, *_ = card["body"]["elements"]
+    assert panel["expanded"] is False and panel["elements"][0]["content"] == "思考"
+    assert answer["content"] == "complete answer"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
 
 @pytest.mark.asyncio
@@ -273,7 +300,7 @@ async def test_real_interaction_boundary_keeps_followup(adapter, reopen):
     consumer = GatewayStreamConsumer(
         adapter,
         "chat",
-        config=StreamConsumerConfig(edit_interval=0.01, cursor=""),
+        config=StreamConsumerConfig(transport="auto", edit_interval=0.01, cursor=""),
         initial_reply_to_id="in",
     )
     task = asyncio.create_task(consumer.run())
@@ -282,25 +309,20 @@ async def test_real_interaction_boundary_keeps_followup(adapter, reopen):
     await adapter.cards.observe("in", "tool_start", {
         "tool_name": "clarify", "tool_call_id": "clarify-call", "turn_id": "agent-turn",
     })
-    future, _ = consumer.close_for_approval_prompt(reason="Clarify" if reopen else "Approval", reopen=reopen)
+    future = consumer.close_for_approval_prompt(reason="Clarify" if reopen else "Approval", reopen=reopen)
     assert await asyncio.wait_for(future, 2)
-    assert "Running" in str(adapter.cards._client.cardkit_update.call_args)
     await adapter.cards.observe("in", "tool_end", {
         "tool_name": "clarify", "tool_call_id": "clarify-call", "turn_id": "agent-turn",
         "duration_ms": 1000,
     })
-    assert "Succeeded" in str(adapter.cards._client.cardkit_update.call_args)
-    assert "Running" not in str(adapter.cards._client.cardkit_update.call_args)
-    assert adapter.cards._client.cardkit_close_streaming.await_count == 1
-    consumer.on_delta("after")
-    consumer.finish("after")
+    consumer.on_delta("after approval")
+    consumer.finish("after approval")
     await asyncio.wait_for(task, 2)
     assert not adapter.cards.turns
-    if reopen:
-        assert adapter.cards._client.cardkit_create.call_count == 2
-        assert "after" in str(adapter.cards._client.cardkit_update.call_args)
-    else:
-        assert "after" in str(adapter.cards._client.send_card_to_chat.call_args)
+    adapter.cards._client.cardkit_create.assert_awaited_once()
+    adapter.cards._client.cardkit_close_streaming.assert_awaited_once()
+    assert "after approval" in str(adapter.cards._client.cardkit_update.call_args)
+    assert "Succeeded" in str(adapter.cards._client.cardkit_update.call_args)
 
 
 @pytest.mark.asyncio
@@ -382,12 +404,13 @@ async def test_clarify_does_not_replace_model_text(adapter):
 @pytest.mark.asyncio
 async def test_interim_is_rendered_in_card_without_text_bubble(adapter):
     set_session_vars(platform="feishu", chat_id="chat", message_id="in", session_key="s")
-    await adapter.send_stream_frame("", chat_id="chat", reply_to="in", turn_id="t")
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "", metadata={"reply_to_message_id": "in"})
     with patch.object(builtin.FeishuAdapter, "send", new=AsyncMock()) as native_send:
         result = await adapter.send("chat", "checking", metadata={"_interim_send": True})
     assert result.success
     native_send.assert_not_awaited()
-    await adapter.send_stream_frame("answer", chat_id="chat", reply_to="in", turn_id="t", finalize=True)
+    assert (await adapter.send("chat", "answer", metadata={"notify": True})).success
     final = str(adapter.cards._client.cardkit_update.call_args)
     assert "checking" in final and "answer" in final
 
@@ -399,6 +422,8 @@ async def test_native_clarify_text_card_keeps_core_reply_resolution(adapter):
     register("clarify", "s", "Which?", ["A", "B"])
     try:
         mark_awaiting_text("clarify")
+        adapter._client = MagicMock()
+        adapter._send_interactive_card = AsyncMock(return_value=SendResult(success=True, message_id="clarify-card"))
         sent = await adapter.send_clarify("chat", "Which?", ["A", "B"], "clarify", "s")
         assert sent.success
         assert _entries["clarify"].awaiting_text
@@ -428,12 +453,12 @@ async def test_real_consumers_in_same_chat_keep_separate_contexts(adapter):
         consumer = GatewayStreamConsumer(
             adapter,
             "chat",
-            config=StreamConsumerConfig(edit_interval=0.01, cursor=""),
+            config=StreamConsumerConfig(transport="auto", edit_interval=0.01, cursor=""),
             initial_reply_to_id=message_id,
         )
         task = asyncio.create_task(consumer.run())
         consumer.on_delta(text)
-        await asyncio.sleep(0.02)
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
         consumer.finish(text)
         await task
         assert consumer.final_content_delivered
@@ -472,27 +497,32 @@ def test_discovery_keeps_user_adapter_after_builtin_lazy_load(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_background_card_uses_explicit_target_without_merging_active_turn(adapter):
     set_session_vars(platform="feishu", chat_id="foreground", message_id="in", session_key="s")
-    await adapter.send_stream_frame("foreground", chat_id="foreground", reply_to="in", turn_id="t")
+    assert adapter.supports_draft_streaming(chat_id="foreground")
+    await adapter.send_draft("foreground", 1, "foreground", metadata={"reply_to_message_id": "in"})
     result = await adapter.send(
         "background", "done", metadata={"non_conversational": True, "_interim_send": True, "thread_id": "topic"},
     )
     assert result.success
-    assert adapter.cards.turns["t"].text == "foreground"
+    assert adapter.cards.turns["in"].text == "foreground"
     adapter.cards._client.send_card_to_chat.assert_awaited_once()
     assert adapter.cards._client.send_card_to_chat.call_args.args[0] == "background"
     assert adapter.cards._client.send_card_to_chat.call_args.kwargs["reply_to_message_id"] == "topic"
     await adapter.cards.close()
 
 
-def test_registry_factory_resolves_credentials_from_host_environment(tmp_path):
+def test_registry_factory_resolves_credentials_from_host_environment(monkeypatch):
     from gateway.platform_registry import platform_registry
 
     manifest = parse_manifest_file(ROOT / "plugin.yaml", ROOT, "user", "")
     manager = PluginManager()
+    monkeypatch.setenv("FEISHU_APP_ID", "app")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "secret")
     try:
         register(PluginContext(manifest, manager))
-        config = PlatformConfig(enabled=True)
-        assert not config.extra.get("app_id")
+        from gateway.config import load_gateway_config
+
+        config = load_gateway_config().platforms[Platform.FEISHU]
+        assert config.extra["app_id"] == "app"
         entry = platform_registry.get("feishu")
         assert entry.validate_config(config)
         value = platform_registry.create_adapter("feishu", config)
@@ -507,7 +537,7 @@ async def test_default_cursor_stream_updates_one_answer_element(adapter):
     """真实消费者的默认光标不能导致每帧新建正文元素."""
     set_session_vars(platform="feishu", chat_id="chat", message_id="cursor-in")
     consumer = GatewayStreamConsumer(
-        adapter, "chat", config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        adapter, "chat", config=StreamConsumerConfig(transport="auto", edit_interval=0.01, buffer_threshold=1),
         initial_reply_to_id="cursor-in",
     )
     sent = asyncio.Queue()
@@ -537,7 +567,7 @@ async def test_long_running_consumer_survives_new_stream(adapter, other_chat, wa
     """超过旧 TTL 的输出中/工具等待中回合，不能被另一个消费者清理或吞掉最终答案."""
     set_session_vars(platform="feishu", chat_id="chat-a", message_id="in-a", session_key="s-a")
     a = GatewayStreamConsumer(
-        adapter, "chat-a", config=StreamConsumerConfig(cursor=""), initial_reply_to_id="in-a",
+        adapter, "chat-a", config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id="in-a",
     )
     tasks = [asyncio.create_task(a.run())]
     try:
@@ -555,7 +585,7 @@ async def test_long_running_consumer_survives_new_stream(adapter, other_chat, wa
 
         set_session_vars(platform="feishu", chat_id=other_chat, message_id="in-b", session_key="s-b")
         b = GatewayStreamConsumer(
-            adapter, other_chat, config=StreamConsumerConfig(cursor=""), initial_reply_to_id="in-b",
+            adapter, other_chat, config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id="in-b",
         )
         tasks.append(asyncio.create_task(b.run()))
         b.on_delta("other answer")
@@ -595,7 +625,7 @@ async def test_real_consumer_recovers_sequence_conflict_without_fallback(adapter
     operation.side_effect = chain([FeishuAPIError("sequence conflict", code=300317)], repeat(None))
     set_session_vars(platform="feishu", chat_id="chat", message_id="in", session_key="s")
     consumer = GatewayStreamConsumer(
-        adapter, "chat", config=StreamConsumerConfig(cursor=""), initial_reply_to_id="in",
+        adapter, "chat", config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id="in",
     )
     task = asyncio.create_task(consumer.run())
     try:
@@ -622,20 +652,164 @@ async def test_real_consumer_recovers_sequence_conflict_without_fallback(adapter
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["cardkit_close_streaming", "cardkit_update"])
-async def test_exhausted_sequence_recovery_uses_host_fallback(adapter, method):
+async def test_exhausted_sequence_recovery_patches_original_message(adapter, method):
     from hermes_lark_streaming.feishu import FeishuAPIError
 
     operation = getattr(adapter.cards._client, method)
     operation.side_effect = FeishuAPIError("sequence conflict", code=300317)
     set_session_vars(platform="feishu", chat_id="chat", message_id="in", session_key="s")
     consumer = GatewayStreamConsumer(
-        adapter, "chat", config=StreamConsumerConfig(cursor=""), initial_reply_to_id="in",
+        adapter, "chat", config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id="in",
     )
+    task = asyncio.create_task(consumer.run())
     consumer.on_delta("answer")
+    assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
     consumer.finish("complete answer")
-    await asyncio.wait_for(consumer.run(), 2)
+    await asyncio.wait_for(task, 2)
     assert operation.await_count == 3
     assert consumer.final_content_delivered
-    adapter.cards._client.send_card_to_chat.assert_awaited_once()
-    assert "complete answer" in str(adapter.cards._client.send_card_to_chat.call_args)
+    assert consumer.message_id == "message-id"
+    adapter.cards._client.send_card_to_chat.assert_not_called()
+    adapter.cards._client.update_card_message.assert_awaited_once()
+    assert "complete answer" in str(adapter.cards._client.update_card_message.call_args)
     assert not adapter.cards.turns
+
+
+@pytest.mark.asyncio
+async def test_consecutive_turns_late_final_and_reconciliation_keep_original_cards(adapter):
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+
+    gateway = GatewayTurnMixin()
+    client = adapter.cards._client
+    client.reply_card_by_id.side_effect = ["om_first", "om_second"]
+    for index, mid in enumerate(("om_first", "om_second")):
+        source = f"incoming-{index}"
+        set_session_vars(platform="feishu", chat_id="chat", message_id=source, session_key="same-session")
+        consumer = GatewayStreamConsumer(
+            adapter, "chat", config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id=source,
+        )
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta(f"preview {index}")
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+        await adapter.cards.observe(source, "end", {"completed": True})
+        assert client.cardkit_close_streaming.await_count == index
+        consumer.finish(f"complete answer {index}")
+        await asyncio.wait_for(task, 2)
+        assert consumer.message_id == mid
+        assert consumer.delivered_final_matches(f"complete answer {index}") is True
+        response = {"final_response": f"expanded final {index}"}
+        turn = TurnContext(
+            stream_consumer_holder=[consumer],
+            source=SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u"),
+            session_key="same-session",
+        )
+        await gateway._run_agent_mark_streamed_delivery(response, turn)
+        assert response["already_sent"] is True
+        assert f"expanded final {index}" in str(client.cardkit_update.call_args)
+        # Retrying the same full text must acknowledge it without a new write or a new message.
+        edits = client.cardkit_update.await_count
+        repeated = await adapter.send("chat", f"expanded final {index}", metadata={"notify": True})
+        assert repeated.message_id == mid and client.cardkit_update.await_count == edits
+    assert client.cardkit_create.await_count == 2
+    assert client.cardkit_close_streaming.await_count == 2
+    client.send_card_to_chat.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_host_final_delivery_uses_inbound_id_after_context_reset(adapter):
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u")
+    event = MessageEvent(text="question", source=source, message_id="incoming", reply_to_message_id="quoted")
+    set_session_vars(platform="feishu", chat_id="chat", message_id="incoming", session_key="session")
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "preview", metadata={"reply_to_message_id": "quoted"})
+    reset_session_vars()
+
+    result, delivery_adapter = await adapter.send_final_ledgered(
+        event, "session", "complete answer", {"notify": True}, reply_to="quoted",
+    )
+    assert result.success and result.message_id == "message-id"
+    assert delivery_adapter is adapter
+    client = adapter.cards._client
+    assert "complete answer" in str(client.cardkit_update.call_args)
+    client.reply_card_by_id.assert_awaited_once_with("quoted", "card-id")
+    client.send_card_to_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_final_uses_queued_inbound_id_and_original_card(adapter):
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u")
+    first = MessageEvent(text="first", source=source, message_id="first")
+    queued = MessageEvent(text="second", source=source, message_id="queued")
+    client = adapter.cards._client
+    client.reply_card_by_id.side_effect = ["om_first", "om_queued"]
+    set_session_vars(platform="feishu", chat_id="chat", message_id="first", session_key="session")
+
+    await adapter.on_processing_start(first)
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "first preview", {"reply_to_message_id": "first"})
+    assert (await adapter.send("chat", "first final", metadata={"notify": True})).message_id == "om_first"
+
+    await adapter.on_processing_start(queued)
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 2, "second preview", {"reply_to_message_id": "queued"})
+    await adapter.on_processing_complete(queued, ProcessingOutcome.SUCCESS)
+    assert adapter.processing_source_id("chat") == "first"
+    reset_session_vars()
+
+    first.ledger_message_id = "queued"
+    result, _ = await adapter.send_final_ledgered(
+        first, "session", "second final", {"notify": True}, reply_to="first",
+    )
+    assert result.success and result.message_id == "om_queued"
+    assert "second final" in str(client.cardkit_update.call_args)
+    assert client.cardkit_close_streaming.await_count == 2
+    assert [call.args[0] for call in client.reply_card_by_id.call_args_list] == ["first", "queued"]
+    client.send_card_to_chat.assert_not_awaited()
+    await adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_stopped_card_does_not_accept_late_final(adapter):
+    set_session_vars(platform="feishu", chat_id="chat", message_id="incoming")
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.send_draft("chat", 1, "partial")
+
+    client = adapter.cards._client
+    client.send_card_to_chat.assert_awaited_once()
+    await adapter.abandon_open_draft("chat", "partial")
+    result = await adapter.send("chat", "late answer", metadata={"notify": True})
+    assert not result.success
+    client.cardkit_close_streaming.assert_awaited_once()
+    client.update_card_message.assert_not_awaited()
+    client.send_card_to_chat.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_long_reply_keeps_full_cardkit_content(adapter):
+    set_session_vars(platform="feishu", chat_id="chat", message_id="incoming")
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", config=StreamConsumerConfig(transport="auto", cursor=""), initial_reply_to_id="incoming",
+    )
+    sections = [f"Section {i:02d}\n" + "This is a line in the report.\n" * 45 for i in range(10)]
+    preview = "\n".join(sections[:-1])
+    final = preview + "\n" + sections[-1]
+    assert len(preview) > adapter.MAX_MESSAGE_LENGTH
+
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta(preview)
+    assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+    consumer.finish(final)
+    await asyncio.wait_for(task, 2)
+
+    assert consumer.message_id == "message-id"
+    assert consumer.final_content_delivered and consumer.delivered_final_matches(final)
+    client = adapter.cards._client
+    client.reply_card_by_id.assert_awaited_once_with("incoming", "card-id")
+    client.cardkit_update.assert_awaited_once()
+    client.send_card_to_chat.assert_not_awaited()
+    client.update_card_message.assert_not_awaited()
+    card = client.cardkit_update.call_args.args[1]
+    rendered = "\n".join(e["content"] for e in card["body"]["elements"] if e["tag"] == "markdown")
+    assert rendered.count("This is a line in the report.") == 450
+    assert all(rendered.count(f"Section {i:02d}") == 1 for i in range(10))

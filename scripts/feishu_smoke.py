@@ -64,8 +64,7 @@ async def run_scenario(
         raise RuntimeError("split: expected an additional card")
 
     if scenario == "stop":
-        await cards.close_source(key)
-        if key in cards.turns or not cards._finished.get(key, (False, False))[0]:
+        if not await cards.close_source(key) or key in cards.turns:
             raise RuntimeError("stop: card completion failed")
     else:
         await frame(f"{title} 流式、工具状态及收尾完成 ✅", finalize=True)

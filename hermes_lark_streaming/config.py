@@ -11,8 +11,7 @@ import yaml
 DEFAULT_DOMAIN = "https://open.feishu.cn"  # SDK 根域名，Larksuite 用 https://open.larksuite.com
 LARK_DOMAIN = "https://open.larksuite.com"
 
-# 平台身份：用独立名字，避免和内置 feishu 平台抢注册（同 Aowen 的做法）
-PLATFORM = "feishu-streaming"
+PLATFORM = "feishu"
 
 
 def hermes_home() -> Path:
@@ -43,6 +42,11 @@ class Config:
         return bool(sec.get("enabled", True))
 
     @property
+    def draft_transport(self) -> bool:
+        streaming = self._reload().get("streaming") or {}
+        return isinstance(streaming, dict) and streaming.get("transport", "auto") in ("auto", "draft")
+
+    @property
     def panel_expanded(self) -> bool:
         """完成态卡片中面板（工具、推理）是否保持展开."""
         sec = self._card_options()
@@ -54,15 +58,17 @@ class Config:
 
         每次都从磁盘重读，因为 /reasoning 命令会在运行时修改配置文件.
         """
+        override = self._card_options().get("show_reasoning")
+        if isinstance(override, bool):
+            return override
         display = self._reload().get("display")
         if not isinstance(display, dict):
             return False
         platforms = display.get("platforms")
         if isinstance(platforms, dict):
-            for name in (PLATFORM, "feishu"):
-                feishu = platforms.get(name)
-                if isinstance(feishu, dict) and "show_reasoning" in feishu:
-                    return bool(feishu["show_reasoning"])
+            feishu = platforms.get(PLATFORM)
+            if isinstance(feishu, dict) and "show_reasoning" in feishu:
+                return bool(feishu["show_reasoning"])
         return bool(display.get("show_reasoning", False))
 
     @property
@@ -77,10 +83,9 @@ class Config:
             return True
         platforms = display.get("platforms")
         if isinstance(platforms, dict):
-            for name in (PLATFORM, "feishu"):
-                feishu = platforms.get(name)
-                if isinstance(feishu, dict) and "show_tool_use" in feishu:
-                    return bool(feishu["show_tool_use"])
+            feishu = platforms.get(PLATFORM)
+            if isinstance(feishu, dict) and "show_tool_use" in feishu:
+                return bool(feishu["show_tool_use"])
         return bool(display.get("show_tool_use", True))
 
     @property

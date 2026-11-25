@@ -11,7 +11,7 @@ Feishu/Lark CardKit 2.0 streaming cards for **Hermes >= 0.22.0**.
 
 Version 0.14.0 uses Hermes's native platform registry and stream frame contract. It subclasses the built-in Feishu adapter and keeps the `feishu` platform identity, credentials, authorization, sessions, threads and cron targets. Everything runs inside the Gateway process: no source patches, AST rewriting, monkey-patching or sidecar.
 
-The existing card renderer provides reasoning/tool panels, image handling and long-card splitting. Native hooks supply supplemental telemetry; native stream frames are the only source of answer text. The registered standalone sender supports cron deliveries without a running Gateway.
+The card renderer provides reasoning and tool panels, image handling, and card splitting. Hermes sends incremental text through the draft transport and receives the Feishu message ID when the card is finalized. The registered standalone sender supports cron deliveries without a running Gateway.
 
 ## Requirements
 
@@ -59,7 +59,7 @@ display:
       show_reasoning: false
 ```
 
-Hermes's master switch `streaming.enabled` defaults to `false` and must be enabled. Do not set `streaming.transport: off` or `display.platforms.feishu.streaming: false`.
+Enable Hermes's `streaming.enabled` switch. CardKit uses the default `streaming.transport: auto` and also supports `draft`. If you override `display.platforms.feishu.streaming`, set it to `true`.
 
 ### Card options
 
@@ -119,19 +119,24 @@ A flat array such as `[status, elapsed]` creates one row. An empty array restore
 | Configuration path | Default | Effect |
 | --- | --- | --- |
 | `display.platforms.feishu.show_tool_use` | `true` | Show tool names, short arguments, status and duration; omit full successful results |
-| `display.platforms.feishu.show_reasoning` | `false` | Show reasoning provided by the model; also enable the event switch below |
+| `platforms.feishu.extra.card.show_reasoning` | Inherits from `display` | Show the card's reasoning panel. Enable the event switch below as well. |
 | `plugins.stream_reasoning_deltas` | `false` | Allow Hermes to send streaming reasoning events to plugins |
 | `display.platforms.feishu.tool_progress` | Set by Hermes | Set to `'off'` to avoid duplicating the plugin's tool panel with host progress text |
 
-For `show_tool_use` and `show_reasoning`, precedence is Feishu-specific setting → the same key under global `display` → the default above. To display reasoning:
+The reasoning panel reads `card.show_reasoning` first, followed by the Feishu and global settings under `display`. Enabling Hermes's `display.platforms.feishu.show_reasoning` makes the gateway hold the reasoning and answer until the turn ends. This configuration enables both the reasoning panel and incremental answer delivery.
 
 ```yaml
 plugins:
   stream_reasoning_deltas: true
+platforms:
+  feishu:
+    extra:
+      card:
+        show_reasoning: true
 display:
   platforms:
     feishu:
-      show_reasoning: true
+      show_reasoning: false
 ```
 
 Display switches do not restrict tool permissions or make a model provide reasoning it does not emit.
@@ -144,7 +149,7 @@ Keep using Hermes's built-in Feishu credentials (`FEISHU_APP_ID`, `FEISHU_APP_SE
 
 Legacy card options move from `streaming.*` to `platforms.feishu.extra.card`; the global `streaming.enabled` stays in place. Configuration is not automatically migrated; see the [migration guide](MIGRATION.md).
 
-Approval follow-ups are delivered as final static cards under the Hermes 0.22.0 protocol; clarification can reopen streaming. Clarification uses the built-in text reply flow, and approval buttons retain built-in callbacks.
+The built-in Feishu adapter handles clarification and approval prompts. The turn's card continues to receive the answer after the tool completes.
 
 ## Card Preview
 

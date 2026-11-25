@@ -126,18 +126,20 @@ async def test_usage_dedup_and_child_turn_does_not_pollute(controller):
 async def test_stop_and_late_frame_do_not_reopen_card(controller):
     await controller.frame("t", "chat", "partial", reply_to="in", source_id="in")
     await controller.observe("in", "end", {"interrupted": True, "completed": False})
-    assert await controller.frame("t", "chat", "late", reply_to="in", source_id="in")
-    assert await controller.frame("t", "chat", "", reply_to="in", source_id="in")
+    assert not await controller.frame("t", "chat", "late", reply_to="in", source_id="in")
+    assert not await controller.frame("t", "chat", "", reply_to="in", source_id="in")
     assert controller._client.cardkit_create.call_count == 1
     assert not controller.turns
 
 
 @pytest.mark.asyncio
-async def test_explicit_seed_reopens_after_approval_boundary(controller):
+async def test_late_final_updates_same_card_without_reopening(controller):
     await controller.frame("t", "chat", "等待确认", reply_to="in", source_id="in", finalize=True)
     await controller.frame("t", "chat", "", reply_to="in", source_id="in")
     await controller.frame("t", "chat", "继续回答", reply_to="in", source_id="in", finalize=True)
-    assert controller._client.cardkit_create.call_count == 2
+    assert controller._client.cardkit_create.call_count == 1
+    assert controller._client.cardkit_close_streaming.call_count == 1
+    assert "继续回答" in str(controller._client.cardkit_update.call_args)
 
 
 @pytest.mark.asyncio
@@ -198,7 +200,7 @@ async def test_deleted_card_stops_future_flushes(controller):
     await session.flush.flush_now(lambda: controller._do_flush(session))
     assert session.state.is_terminal
     calls = controller._client.cardkit_batch_update.call_count
-    assert await controller.frame("t", "chat", "late", reply_to="in", source_id="in")
+    assert not await controller.frame("t", "chat", "late", reply_to="in", source_id="in")
     assert controller._client.cardkit_batch_update.call_count == calls
     assert not controller.turns
 

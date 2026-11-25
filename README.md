@@ -61,7 +61,7 @@ display:
       show_reasoning: false
 ```
 
-`streaming.enabled` 是 Hermes 的流式总开关，默认 `false`，必须开启；同时不要将 `streaming.transport` 设为 `off`，或将 `display.platforms.feishu.streaming` 设为 `false`。
+`streaming.enabled` 是 Hermes 的流式总开关。飞书 CardKit 使用默认的 `streaming.transport: auto`，也支持 `draft`。如果覆盖了 `display.platforms.feishu.streaming`，请设为 `true`。
 
 ### 卡片参数
 
@@ -121,19 +121,24 @@ footer:
 | 配置路径 | 默认值 | 作用 |
 | --- | --- | --- |
 | `display.platforms.feishu.show_tool_use` | `true` | 显示卡片工具面板：名称、简短参数、状态和耗时；不展示完整成功结果 |
-| `display.platforms.feishu.show_reasoning` | `false` | 显示模型提供的思考内容，还需开启下方事件开关 |
+| `platforms.feishu.extra.card.show_reasoning` | 继承 `display` | 显示卡片思考面板，需开启下方事件开关 |
 | `plugins.stream_reasoning_deltas` | `false` | 允许 Hermes 向插件提供流式思考事件 |
 | `display.platforms.feishu.tool_progress` | Hermes 决定 | 建议设为 `'off'`，避免宿主工具进度文本与卡片工具面板重复 |
 
-`show_tool_use`、`show_reasoning` 的读取顺序为飞书专属设置 → `display` 下的同名全局设置 → 表中默认值。例如展示思考：
+卡片思考面板优先读取 `card.show_reasoning`，再读取 `display` 里的飞书及全局设置。Hermes 开启自己的 `display.platforms.feishu.show_reasoning` 时会把思考和正文留到回合结束后一起发送。下面的配置同时启用思考面板和正文流式输出。
 
 ```yaml
 plugins:
   stream_reasoning_deltas: true
+platforms:
+  feishu:
+    extra:
+      card:
+        show_reasoning: true
 display:
   platforms:
     feishu:
-      show_reasoning: true
+      show_reasoning: false
 ```
 
 展示开关不限制工具权限，也不会让模型产生原本未提供的思考内容。
@@ -146,7 +151,7 @@ display:
 
 旧版卡片参数从 `streaming.*` 移至 `platforms.feishu.extra.card`，全局 `streaming.enabled` 保留原位；插件不会自动迁移旧配置，详见 [升级说明](MIGRATION.md)。
 
-命令审批后的答案遵循 Hermes 0.22.0 的协议，一次性发送终态卡；澄清后可恢复流式。澄清选项沿用内置文本回复流程，审批按钮沿用内置卡片回调。
+澄清和审批的交互由内置飞书适配器处理。工具完成后，正文继续更新到本轮的卡片。
 
 ## 卡片展示
 
