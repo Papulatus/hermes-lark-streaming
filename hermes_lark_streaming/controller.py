@@ -62,6 +62,7 @@ class StreamCardController(StreamingController):
         *,
         reply_to: str | None,
         source_id: str,
+        thread_id: str | None = None,
         finalize: bool = False,
         session_key: str = "",
     ) -> bool:
@@ -71,6 +72,7 @@ class StreamCardController(StreamingController):
             session = CardSession(source_id, chat_id, asyncio.get_running_loop())
             session.session_key = session_key
             session.anchor_id = reply_to
+            session.thread_id = thread_id
             turn = self.turns[key] = Turn(session, source_id)
         async with turn.lock:
             session = turn.session

@@ -54,6 +54,7 @@ class CardSession:
         "split_disabled",
         "split_index",
         "state",
+        "thread_id",
         "tool_use",
     )
 
@@ -66,6 +67,7 @@ class CardSession:
         self.message_id = message_id
         self.anchor_id: str | None = None
         self.chat_id = chat_id
+        self.thread_id: str | None = None
         self.session_key: str | None = None
         self.state = SessionState.IDLE
         self.card_msg_id: str | None = None

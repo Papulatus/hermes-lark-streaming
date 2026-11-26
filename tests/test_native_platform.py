@@ -15,7 +15,7 @@ pytest.importorskip("gateway.stream_consumer", reason="Requires a Hermes >= 0.22
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, ProcessingOutcome, SendResult
 from gateway.session import SessionSource
-from gateway.session_context import reset_session_vars, set_session_vars
+from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from hermes_cli.plugins import PluginContext, PluginManager
 from hermes_cli.plugins_manifest import parse_manifest_file
@@ -734,6 +734,66 @@ async def test_host_final_delivery_uses_inbound_id_after_context_reset(adapter):
     assert "complete answer" in str(client.cardkit_update.call_args)
     client.reply_card_by_id.assert_awaited_once_with("quoted", "card-id")
     client.send_card_to_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", [None, "omt_topic"])
+async def test_process_completion_streams_without_platform_message_id(adapter, thread_id):
+    client = adapter.cards._client
+    client.send_card_to_chat.side_effect = ["om_first", "om_second"]
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u", thread_id=thread_id)
+    foreground = MessageEvent(text="question", source=source, message_id="om_human")
+    await adapter.on_processing_start(foreground)
+
+    for index in (1, 2):
+        event = MessageEvent(text="background process finished", source=source, internal=True,
+                             message_id=f'["completion","proc_{index}",1]')
+        tokens = set_session_vars(platform="feishu", chat_id="chat", session_key="session", turn_event=event)
+        try:
+            consumer = GatewayStreamConsumer(
+                adapter, "chat", metadata={"thread_id": thread_id} if thread_id else None,
+                config=StreamConsumerConfig(transport="auto", edit_interval=0.01, buffer_threshold=1, cursor=""),
+            )
+            task = asyncio.create_task(consumer.run())
+            consumer.on_delta(f"Result {index} ")
+            for _ in range(100):
+                if client.send_card_to_chat.await_count == index:
+                    break
+                await asyncio.sleep(0.01)
+            assert client.send_card_to_chat.await_count == index
+            assert client.send_card_to_chat.call_args.kwargs.get("thread_id") == thread_id
+            assert adapter.cards.turns[event.message_id].source_id == event.message_id
+            consumer.finish(f"Result {index} verified")
+            await asyncio.wait_for(task, 2)
+            assert consumer.final_content_delivered
+            assert f"Result {index} verified" in str(client.cardkit_update.call_args)
+        finally:
+            clear_session_vars(tokens)
+
+    assert not adapter.cards.turns
+    assert client.cardkit_create.await_count == client.cardkit_close_streaming.await_count == 2
+    client.reply_card_by_id.assert_not_awaited()
+    assert adapter.processing_source_id("chat") == "om_human"
+    await adapter.on_processing_complete(foreground, ProcessingOutcome.SUCCESS)
+
+
+@pytest.mark.asyncio
+async def test_silent_internal_heartbeat_does_not_create_empty_card(adapter):
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u")
+    event = MessageEvent(text="still running", source=source, internal=True,
+                         message_id='["heartbeat","proc_1","tick_1"]')
+    set_session_vars(platform="feishu", chat_id="chat", session_key="session", turn_event=event)
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", config=StreamConsumerConfig(transport="auto", edit_interval=0.01, cursor=""),
+    )
+    assert adapter.supports_draft_streaming(chat_id="chat")
+    await adapter.observe_card(event.message_id, "chat", "start", {})
+    consumer.on_delta("[SILENT]")
+    consumer.finish("[SILENT]")
+    await asyncio.wait_for(consumer.run(), 2)
+    adapter.cards._client.cardkit_create.assert_not_awaited()
+    adapter.cards._client.send_card_to_chat.assert_not_awaited()
+    assert not adapter.cards.turns and not adapter._observations
 
 
 @pytest.mark.asyncio

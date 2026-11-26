@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from sys import maxsize
 from typing import Any, cast
 
+from gateway import session_context
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
 from gateway.session_context import get_session_env
 from plugins.platforms.feishu import adapter as builtin
@@ -29,6 +30,7 @@ class CardObservations:
     pending: deque[tuple[str, dict[str, Any]]] = field(default_factory=lambda: deque(maxlen=256))
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     streaming: bool = False
+    waiting_for_text: bool = False
 
 
 class FeishuStreamingAdapter(builtin.FeishuAdapter):
@@ -73,7 +75,19 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
                 self._card_routes.popitem(last=False)
         await super().handle_message(event)
 
+    @staticmethod
+    def _internal_event(chat_id: str) -> MessageEvent | None:
+        # A producer event has its own identity even when its source has no reply anchor.
+        bound_event = getattr(session_context, "_SESSION_TURN_EVENT", None)
+        event = bound_event.get() if bound_event is not None else None
+        if isinstance(event, MessageEvent) and event.internal and event.source.chat_id == chat_id:
+            return event
+        return None
+
     def processing_source_id(self, chat_id: str) -> str:
+        internal = self._internal_event(chat_id)
+        if internal is not None:
+            return str(internal.message_id or "")
         stack = self._processing_sources.get()
         if stack:
             source_chat, source_id = stack[-1]
@@ -82,6 +96,19 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         if chat_id and source_chat and chat_id != source_chat:
             return ""
         return str(get_session_env("HERMES_SESSION_MESSAGE_ID") or "")
+
+    def _card_observations(self, chat_id: str, source_id: str, *, create: bool = False) -> CardObservations | None:
+        event = self._internal_event(chat_id)
+        if event is not None and event.message_id == source_id:
+            # The authority executes synthetic turns without processing hooks. The event
+            # owns its buffer so silent turns need no adapter cleanup.
+            observations = getattr(event, "_cheerwhy_card_observations", None)
+            if observations is None:
+                observations = CardObservations(waiting_for_text=True)
+                vars(event)["_cheerwhy_card_observations"] = observations
+            return cast(CardObservations, observations)
+        route = (chat_id, source_id)
+        return self._observations.setdefault(route, CardObservations()) if create else self._observations.get(route)
 
     def streaming_overflow_limit(self) -> int | None:
         if (
@@ -105,14 +132,15 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
             self._card_loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
-        observations = self._observations.setdefault((chat_id, source_id), CardObservations())
+        observations = self._card_observations(chat_id, source_id, create=True)
+        assert observations is not None
         observations.streaming = True
         if observations.pending:
             self._card_loop.create_task(self._drain_observations(source_id, chat_id, observations))
         return True
 
     async def observe_card(self, source_id: str, chat_id: str, kind: str, payload: dict[str, Any]) -> None:
-        observations = self._observations.get((chat_id, source_id))
+        observations = self._card_observations(chat_id, source_id)
         if observations is None:
             return
         observations.pending.append((kind, payload))
@@ -121,7 +149,7 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
 
     async def _drain_observations(self, source_id: str, chat_id: str, observations: CardObservations) -> None:
         async with observations.lock:
-            while observations.streaming and observations.pending:
+            while observations.streaming and not observations.waiting_for_text and observations.pending:
                 kind, payload = observations.pending.popleft()
                 try:
                     await self._apply_observation(source_id, chat_id, kind, payload)
@@ -132,27 +160,36 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         if kind in {"start", "reasoning", "tool_start"} and source_id not in self.cards.turns:
             if kind == "reasoning" and not self.cards._cfg.show_reasoning:
                 return
-            await self.cards.frame(
-                source_id, chat_id, "", source_id=source_id,
-                reply_to=self._card_routes.get((chat_id, source_id), source_id),
-                session_key=get_session_env("HERMES_SESSION_KEY"),
-            )
+            await self._card_frame(source_id, chat_id, "", reply_to=source_id)
         await self.cards.observe(source_id, kind, payload)
+
+    async def _card_frame(
+        self, source_id: str, chat_id: str, content: str, *, reply_to: str | None = None,
+    ) -> bool:
+        internal = self._internal_event(chat_id)
+        return await self.cards.frame(
+            source_id, chat_id, content, source_id=source_id,
+            reply_to=None if internal else self._card_routes.get((chat_id, source_id), reply_to),
+            thread_id=internal.source.thread_id if internal else None,
+            session_key=get_session_env("HERMES_SESSION_KEY"),
+        )
 
     async def send_draft(
         self, chat_id: str, draft_id: int, content: str, metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         source_id = self.processing_source_id(chat_id)
-        observations = self._observations.get((chat_id, source_id))
+        observations = self._card_observations(chat_id, source_id)
         if not observations or not observations.streaming:
             return SendResult(success=False, error="Missing Feishu turn identity")
+        if content.strip():
+            observations.waiting_for_text = False
+        if observations.waiting_for_text:
+            return SendResult(success=True, raw_response={"skipped": True})
         await self._drain_observations(source_id, chat_id, observations)
         if not observations.streaming:
             return SendResult(success=True, raw_response={"skipped": True})
-        anchor = self._card_routes.get((chat_id, source_id), (metadata or {}).get("reply_to_message_id"))
-        ok = await self.cards.frame(
-            source_id, chat_id, content, source_id=source_id, reply_to=anchor,
-            session_key=get_session_env("HERMES_SESSION_KEY"),
+        ok = await self._card_frame(
+            source_id, chat_id, content, reply_to=(metadata or {}).get("reply_to_message_id"),
         )
         message_id = self.cards.message_id(source_id, chat_id)
         if not ok and message_id:
@@ -164,7 +201,8 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         self, chat_id: str, content: str, *, metadata: dict[str, Any] | None = None,
     ) -> None:
         source_id = self.processing_source_id(chat_id)
-        observations = self._observations.pop((chat_id, source_id), None)
+        observations = self._card_observations(chat_id, source_id)
+        self._observations.pop((chat_id, source_id), None)
         if observations:
             observations.streaming = False
             await self.cards.close_source(source_id)
@@ -183,6 +221,8 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         return cast(tuple[SendResult, BasePlatformAdapter], result)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
+        if event.internal:
+            return
         # Queued follow-ups run inside the original gateway context with a new inbound ID.
         if event.message_id:
             route = (event.source.chat_id, event.message_id)
@@ -204,7 +244,8 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
             await self.cards.close_source(
                 source_id, aborted=outcome is ProcessingOutcome.CANCELLED, failed=outcome is ProcessingOutcome.FAILURE,
             )
-        await super().on_processing_complete(event, outcome)
+        if not event.internal:
+            await super().on_processing_complete(event, outcome)
 
     async def send(
         self,
@@ -216,8 +257,11 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         md = metadata or {}
         source_id = md.get("_card_source_id") or self.processing_source_id(chat_id)
         if not md.get("non_conversational") and source_id:
-            observations = self._observations.get((chat_id, source_id))
+            observations = self._card_observations(chat_id, source_id)
             if observations and observations.streaming and (md.get("_interim_send") or md.get("notify")):
+                if observations.waiting_for_text and content.strip():
+                    observations.waiting_for_text = False
+                    await self._card_frame(source_id, chat_id, "")
                 await self._drain_observations(source_id, chat_id, observations)
             if md.get("_interim_send"):
                 message_id = await self.cards.interim(source_id, content)
@@ -233,7 +277,15 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         # 后台通知按明确目标独立投递，不合并进前台活跃卡片
         if not content.strip():
             return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
-        anchor = reply_to or md.get("reply_to_message_id") or md.get("thread_id")
+        thread_id = md.get("thread_id")
+        anchor = reply_to or md.get("reply_to_message_id")
+        topic = {}
+        if not anchor and thread_id:
+            if str(thread_id).startswith("omt_"):
+                topic["thread_id"] = thread_id
+            else:
+                # Older standalone callers store a reply message ID in this field.
+                anchor = thread_id
         try:
             card = build_static_card(content)
             assert self.cards._client is not None
@@ -241,6 +293,7 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
                 chat_id,
                 card,
                 reply_to_message_id=anchor,
+                **topic,
             )
             self._static_cards[message_id] = None
             while len(self._static_cards) > 512:

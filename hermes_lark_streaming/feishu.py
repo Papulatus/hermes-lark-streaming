@@ -177,6 +177,7 @@ class FeishuClient:
         card: dict[str, Any],
         *,
         reply_to_message_id: str | None = None,
+        thread_id: str | None = None,
     ) -> str:
         """向指定聊天发送卡片，可通过消息 ID 定位回复，返回 message_id."""
         request_uuid = uuid.uuid4().hex
@@ -200,10 +201,10 @@ class FeishuClient:
         else:
             request = (
                 CreateMessageRequest.builder()
-                .receive_id_type("chat_id")
+                .receive_id_type("thread_id" if thread_id else "chat_id")
                 .request_body(
                     CreateMessageRequestBody.builder()
-                    .receive_id(chat_id)
+                    .receive_id(thread_id or chat_id)
                     .msg_type("interactive")
                     .content(self._dumps(card))
                     .uuid(request_uuid)

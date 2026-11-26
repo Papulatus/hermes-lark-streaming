@@ -533,8 +533,9 @@ class StreamingController:
         assert self._client is not None
         if session.anchor_id:
             return await self._client.reply_card_by_id(session.anchor_id, card_id)
+        topic = {"thread_id": session.thread_id} if session.thread_id else {}
         return await self._client.send_card_to_chat(
-            chat_id=session.chat_id, card={"type": "card", "data": {"card_id": card_id}},
+            chat_id=session.chat_id, card={"type": "card", "data": {"card_id": card_id}}, **topic,
         )
 
     async def _create_streaming_card(self, session: CardSession) -> tuple[str, str] | None:
