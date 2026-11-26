@@ -23,7 +23,7 @@ def legacy_files() -> list[str]:
         "cron/scheduler.py",
         "cron/scheduler_delivery.py",
     ]
-    return [name for name in names if (root / name).is_file() and "HERMES_LARK_" in (root / name).read_text()]
+    return [name for name in names if (root / name).is_file() and b"HERMES_LARK_" in (root / name).read_bytes()]
 
 
 def main() -> int:
