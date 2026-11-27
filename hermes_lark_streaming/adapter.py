@@ -178,6 +178,8 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         self, source_id: str, chat_id: str, content: str, *, reply_to: str | None = None,
     ) -> bool:
         synthetic = self._synthetic_event(chat_id)
+        if synthetic is not None and self._synthetic_observations(synthetic).source_id != source_id:
+            synthetic = None
         return await self.cards.frame(
             source_id, chat_id, content, source_id=source_id,
             reply_to=None if synthetic else self._card_routes.get((chat_id, source_id), reply_to),
@@ -276,14 +278,22 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
                     await self._card_frame(source_id, chat_id, "")
                 await self._drain_observations(source_id, chat_id, observations)
             if md.get("_interim_send"):
-                message_id = await self.cards.interim(source_id, content)
+                message_id = await self.cards.interim(source_id, content, chat_id=chat_id)
                 if message_id:
                     return SendResult(success=True, message_id=message_id)
                 return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
-            if md.get("notify") and self.cards.message_id(source_id, chat_id):
-                if await self.cards.deliver(source_id, chat_id, content):
-                    return SendResult(success=True, message_id=self.cards.message_id(source_id, chat_id))
-                return SendResult(success=False, error="Could not finalize existing streamed card")
+            if md.get("notify"):
+                has_card = self.cards.message_id(source_id, chat_id) is not None
+                if (
+                    not has_card and observations and observations.streaming and content.strip()
+                    and source_id == self.processing_source_id(chat_id)
+                ):
+                    anchor = reply_to or md.get("reply_to_message_id")
+                    has_card = await self._card_frame(source_id, chat_id, "", reply_to=anchor)
+                if has_card:
+                    if await self.cards.deliver(source_id, chat_id, content):
+                        return SendResult(success=True, message_id=self.cards.message_id(source_id, chat_id))
+                    return SendResult(success=False, error="Could not finalize existing streamed card")
         if md.get("expect_edits"):
             return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
         # 后台通知按明确目标独立投递，不合并进前台活跃卡片

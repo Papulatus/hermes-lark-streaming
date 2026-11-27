@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
+from httpx import ReadTimeout
 
 pytest.importorskip("gateway.stream_consumer", reason="Requires a Hermes >= 0.22.0 checkout")
 
@@ -922,3 +923,214 @@ async def test_long_reply_keeps_full_cardkit_content(adapter):
     rendered = "\n".join(e["content"] for e in card["body"]["elements"] if e["tag"] == "markdown")
     assert rendered.count("This is a line in the report.") == 450
     assert all(rendered.count(f"Section {i:02d}") == 1 for i in range(10))
+
+
+@pytest.fixture
+def cardkit_history(adapter):
+    from hermes_lark_streaming.feishu import FeishuAPIError
+
+    cards = {}
+    messages = {}
+    receipts = {}
+    client = adapter.cards._client
+
+    def check_size(card):
+        if len(json.dumps(card, ensure_ascii=False).encode()) > 30_000:
+            raise FeishuAPIError("Card content exceeds limit", code=200860)
+
+    async def create(card):
+        check_size(card)
+        card_id = f"card-{len(cards) + 1}"
+        cards[card_id] = card
+        return card_id
+
+    async def reply(anchor, card_id, *, request_id=None):
+        if request_id in receipts:
+            return receipts[request_id]
+        message_id = f"om_{card_id}"
+        messages[message_id] = (anchor, card_id)
+        if request_id:
+            receipts[request_id] = message_id
+        return message_id
+
+    async def update(card_id, card, **kwargs):
+        check_size(card)
+        cards[card_id] = card
+
+    async def patch_message(message_id, card):
+        await update(messages[message_id][1], card)
+
+    async def delete_message(message_id):
+        del messages[message_id]
+
+    client.cardkit_create.side_effect = create
+    client.reply_card_by_id.side_effect = reply
+    client.cardkit_update.side_effect = update
+    client.update_card_message.side_effect = patch_message
+    client.delete_card_message.side_effect = delete_message
+    return cards, messages
+
+
+@pytest.mark.asyncio
+async def test_two_tool_rollovers_keep_progress_and_reconcile_sealed_preview(adapter, cardkit_history):
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.turn_context import TurnContext
+
+    cards, messages = cardkit_history
+    adapter.cards._cfg._extra["card"] = {"footer": {"fields": [["elapsed", "tokens", "context", "model"]]}}
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u", thread_id="omt_topic")
+    with patch.object(builtin.FeishuAdapter, "send", new=AsyncMock(return_value=SendResult(success=True))) as send:
+        for index in (1, 2):
+            inbound = f"om_in_{index}"
+            set_session_vars(platform="feishu", chat_id="chat", message_id=inbound, session_key="session")
+            consumer = GatewayStreamConsumer(
+                adapter, "chat", metadata={"thread_id": source.thread_id}, initial_reply_to_id=inbound,
+                config=StreamConsumerConfig(transport="auto", cursor=""),
+            )
+            task = asyncio.create_task(consumer.run())
+            final = f"Report {index}\n\nComplete answer"
+            preview = f"Report {index}\n\nUnconfirmed preview" if index == 1 else final.removesuffix(" answer")
+            progress = f"Processed batch {index}"
+            try:
+                consumer.on_delta(preview)
+                assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+                # A burst of tool events seals the prior answer segment via full-card update.
+                for step in range(60):
+                    tool = {"tool_name": "terminal", "tool_call_id": str(step), "args": {"command": "pwd"}}
+                    await adapter.observe_card(inbound, "chat", "tool_start", tool)
+                    await adapter.observe_card(inbound, "chat", "tool_end", tool)
+                consumer.on_commentary(progress)
+                assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+                own_cards = [cid for anchor, cid in messages.values() if anchor == inbound]
+                assert len(own_cards) == 2
+                send.assert_not_awaited()
+                await adapter.observe_card(inbound, "chat", "usage", {
+                    "api_request_id": str(index), "model": "test-model", "context_length": 40_000,
+                    "usage": {"input_tokens": 100, "output_tokens": 20, "prompt_tokens": 10_000},
+                })
+                await adapter.observe_card(inbound, "chat", "end", {"completed": True})
+                consumer.finish(final)
+                await asyncio.wait_for(task, 5)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await task
+
+            assert consumer.delivered_final_matches(final) is True
+            corrected = final + " verified"
+            response = {"final_response": corrected}
+            ctx = TurnContext(stream_consumer_holder=[consumer], source=source, session_key="session")
+            await GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, ctx)
+            assert response.get("already_sent") is True
+            body = [e for cid in own_cards for e in cards[cid]["body"]["elements"]]
+            assert corrected in [e.get("content") for e in body if e["tag"] == "markdown"]
+            assert str(body).count(f"Report {index}") == 1
+            assert "Unconfirmed preview" not in str(body)
+            assert str(body).count(progress) == 1
+            assert all(not e["expanded"] for e in body if e["tag"] == "collapsible_panel")
+            footer_index, = (i for i, e in enumerate(body) if e["tag"] == "hr")
+            footer = body[footer_index + 1]["content"]
+            assert "test-model" in footer and "10.0K/40.0K (25%)" in footer and "↑ 100 ↓ 20" in footer
+        send.assert_not_awaited()
+    assert len(messages) == 4
+    assert not adapter.cards.turns
+
+
+@pytest.mark.asyncio
+async def test_two_long_finals_fit_cardkit_and_retry_on_the_same_messages(adapter, cardkit_history):
+    cards, messages = cardkit_history
+    client = adapter.cards._client
+    reply = client.reply_card_by_id.side_effect
+    first_continuation = {}
+    attempts = {}
+
+    async def lose_first_continuation_receipt(anchor, card_id, *, request_id=None):
+        message_id = await reply(anchor, card_id, request_id=request_id)
+        if request_id and request_id == first_continuation.setdefault(anchor, request_id):
+            attempts[anchor] = attempts.get(anchor, 0) + 1
+            if attempts[anchor] <= (2 if anchor.endswith("_1") else 1):
+                raise ReadTimeout("Lost continuation receipt")
+        return message_id
+
+    client.reply_card_by_id.side_effect = lose_first_continuation_receipt
+    for index in (1, 2):
+        inbound = f"om_long_{index}"
+        set_session_vars(platform="feishu", chat_id="chat", message_id=inbound, session_key="session")
+        consumer = GatewayStreamConsumer(
+            adapter, "chat", initial_reply_to_id=inbound, config=StreamConsumerConfig(transport="auto", cursor=""),
+        )
+        paragraphs = [f"第{index}轮第{part:02d}段 " + "已核对目录和用量" * 110 for part in range(28)]
+        final = "\n\n".join(paragraphs)
+        task = asyncio.create_task(consumer.run())
+        if index == 1:
+            consumer.on_delta(paragraphs[0])
+            assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+            consumer.finish(final)
+        else:
+            # Final may be ready before any preview cadence has elapsed.
+            consumer.on_delta(final)
+            consumer.finish(final)
+        await asyncio.wait_for(task, 5)
+        owned = {mid: cid for mid, (anchor, cid) in messages.items() if anchor == inbound}
+        assert len(owned) == 3 and consumer.message_id in owned
+        assert attempts[inbound] == (3 if index == 1 else 2)
+        assert consumer.delivered_final_matches(final) is True
+        body = [e for cid in owned.values() for e in cards[cid]["body"]["elements"]]
+        markdown = [e["content"] for e in body if e["tag"] == "markdown" and "i18n_content" not in e]
+        assert "\n\n".join(markdown) == final
+        assert sum(e["tag"] == "hr" for e in body) == 1
+        updates = client.cardkit_update.await_count
+        reset_session_vars()
+        replay = await adapter.edit_message("chat", next(reversed(owned)), final, finalize=True)
+        assert replay.success and client.cardkit_update.await_count == updates
+        replies = [call for call in client.reply_card_by_id.await_args_list if call.args[0] == inbound]
+        assert len({call.kwargs["request_id"] for call in replies if call.kwargs.get("request_id")}) == 2
+        assert len(replies) == (5 if index == 1 else 4)
+
+        # A later authoritative rewrite must remove stale continuations.
+        edited = await adapter.edit_message("chat", consumer.message_id, paragraphs[0], finalize=True)
+        assert edited.success
+        assert [mid for mid in owned if mid in messages] == [consumer.message_id]
+        assert cards[owned[consumer.message_id]]["body"]["elements"][0]["content"] == paragraphs[0]
+    client.send_card_to_chat.assert_not_awaited()
+    client.update_card_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cardkit_batch_update", "cardkit_stream_element"])
+async def test_gateway_restores_expired_stream_on_original_card(adapter, operation):
+    from hermes_lark_streaming.feishu import FeishuAPIError
+
+    client = adapter.cards._client
+    getattr(client, operation).side_effect = [FeishuAPIError("Card streaming expired", code=200850), None]
+    set_session_vars(platform="feishu", chat_id="chat", message_id="om_expired", session_key="session")
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", initial_reply_to_id="om_expired", config=StreamConsumerConfig(transport="auto", cursor=""),
+    )
+    task = asyncio.create_task(consumer.run())
+    try:
+        consumer.on_delta("Progress before final")
+        assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+        session = adapter.cards.turns["om_expired"].session
+        await session.flush.flush_now(lambda: adapter.cards._do_flush(session))
+        client.cardkit_set_streaming.assert_awaited_once()
+        assert client.cardkit_set_streaming.await_args.args == ("card-id", True)
+        calls = getattr(client, operation).await_args_list
+        assert calls[0].args == calls[1].args
+        assert calls[0].kwargs["sequence"] < client.cardkit_set_streaming.await_args.kwargs["sequence"]
+        assert client.cardkit_set_streaming.await_args.kwargs["sequence"] < calls[1].kwargs["sequence"]
+        assert not session.segment_state.has_dirty
+        client.cardkit_close_streaming.side_effect = FeishuAPIError("Already closed", code=300309)
+        consumer.finish("Complete after expiry")
+        await asyncio.wait_for(task, 2)
+    finally:
+        if not task.done():
+            task.cancel()
+            await task
+
+    assert consumer.message_id == "message-id" and consumer.delivered_final_matches("Complete after expiry")
+    client.cardkit_create.assert_awaited_once()
+    client.cardkit_close_streaming.assert_awaited_once()
+    client.cardkit_update.assert_awaited_once()
+    client.update_card_message.assert_not_awaited()
+    client.send_card_to_chat.assert_not_awaited()

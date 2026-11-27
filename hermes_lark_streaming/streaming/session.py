@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +34,18 @@ class SessionState(StrEnum):
         }
 
 
+@dataclass
+class CardPage:
+    card_id: str
+    card_msg_id: str | None
+    sequence: int = 1
+    streaming_closed: bool = False
+    payload: dict[str, Any] | None = None
+    send_id: str | None = None
+    im_patched: bool = False
+    sealed_through: int | None = None
+
+
 class CardSession:
     """单条消息的卡片会话状态."""
 
@@ -48,6 +61,7 @@ class CardSession:
         "guard",
         "image_resolver",
         "message_id",
+        "pages",
         "segment_state",
         "sequence",
         "session_key",
@@ -89,6 +103,7 @@ class CardSession:
         self.element_count: int = 0
         self.split_disabled = False
         self.split_index: int = 0
+        self.pages: list[CardPage] = []
 
     @property
     def has_card(self) -> bool:

@@ -199,6 +199,18 @@ async def test_cardkit_uuid_survives_transient_retries(method, sdk_method, args,
 
 
 @pytest.mark.asyncio
+async def test_cardkit_settings_send_streaming_flag_under_config():
+    sdk = AsyncMock(return_value=_Resp(ok=True))
+    client = _client_with(settings=sdk)
+    await client.cardkit_set_streaming("card", True, sequence=5)
+    await client.cardkit_close_streaming("card", sequence=6)
+    bodies = [c.args[0].request_body for c in sdk.await_args_list]
+    assert [json.loads(body.settings) for body in bodies] == [
+        {"config": {"streaming_mode": True}}, {"config": {"streaming_mode": False}},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stream_uuid_survives_sync_sdk_transient_retries(monkeypatch):
     from unittest.mock import Mock
 

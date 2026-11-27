@@ -12,7 +12,6 @@ from typing import Any
 
 from agent.i18n import get_language, t
 
-from .cardkit.builder import build_static_card
 from .cardkit.i18n import _t
 from .config import Config
 from .feishu import FeishuClient
@@ -105,7 +104,13 @@ class StreamCardController(StreamingController):
     def source_for_message(self, message_id: str, chat_id: str) -> str | None:
         for turns in (self.turns, self._retired):
             for key, turn in turns.items():
-                if turn.session.card_msg_id == message_id and turn.session.chat_id == chat_id:
+                session = turn.session
+                if session.chat_id != chat_id:
+                    continue
+                if (
+                    session.card_msg_id == message_id
+                    or any(page.card_msg_id == message_id for page in session.pages)
+                ):
                     return key
         return None
 
@@ -114,72 +119,81 @@ class StreamCardController(StreamingController):
         if not turn:
             return False
         async with turn.lock:
-            if turn.aborted or self._client is None:
-                return False
-            if await self._deliver_locked(key, turn, text):
-                return True
-            message_id = turn.session.card_msg_id
-            if not message_id:
-                return False
-            # CardKit and IM address different IDs. If the entity update fails,
-            # try replacing the contents of the original message under the same lock.
-            try:
-                await self._client.update_card_message(message_id, build_static_card(text))
-            except Exception:
-                _logger.warning("Could not update streamed message %s", message_id, exc_info=True)
-                return False
-            turn.final_text = text
-            return True
+            return await self._deliver_locked(key, turn, text)
 
     async def _deliver_locked(self, key: str, turn: Turn, text: str) -> bool:
         if not turn.session.card_msg_id or turn.aborted:
             return False
         if turn.final_text == text:
             return True
-        if text != turn.text:
-            is_clarify_prompt = (
-                not turn.text and text == t("gateway.clarify.native_stream_placeholder")
-                and any(step.name == "clarify" and step.status == ToolStatus.RUNNING for step in turn.tools.values())
-            )
-            self._replace_text(turn, text)
-            if is_clarify_prompt:
-                turn.clarify_prompt = turn.session.segment_state.segments[-1]
-        if not await self._finish_locked(key, turn):
+        turn.final_text = None
+        session = turn.session
+        # A rollover in flight can still seal a prefix of the preview. Wait for
+        # that page to be recorded before reconciling the authoritative answer.
+        await session.flush.wait_for_flush()
+        session.flush.mark_completed()
+        is_clarify_prompt = (
+            not turn.text and text == t("gateway.clarify.native_stream_placeholder")
+            and any(step.name == "clarify" and step.status == ToolStatus.RUNNING for step in turn.tools.values())
+        )
+        self._replace_text(turn, text, finalize=True)
+        if is_clarify_prompt:
+            turn.clarify_prompt = session.segment_state.segments[-1]
+        if not await self._finish_locked(key, turn, im_fallback=True):
             return False
         turn.final_text = text
         return True
 
-    async def interim(self, source_id: str, text: str) -> str | None:
+    async def interim(self, source_id: str, text: str, *, chat_id: str | None = None) -> str | None:
         matches = self.find_source(source_id)
         if len(matches) != 1:
             return None
         _, turn = matches[0]
         async with turn.lock:
-            if turn.closing or turn.session.guard.should_skip("interim"):
+            session = turn.session
+            if (
+                (chat_id is not None and session.chat_id != chat_id)
+                or turn.closing
+                or session.guard.should_skip("interim")
+            ):
                 return None
-            # 完整 commentary 可能是刚流过的同一段前奏，不重复追加
-            if not text.strip() or not turn.text.rstrip().endswith(text.strip()):
-                self._on_thinking_segment(turn.session, "\n\n" + text + "\n\n")
-            await turn.session.flush.flush_now(lambda: self._do_flush(turn.session))
-            if turn.session.state.is_terminal or turn.session.segment_state.has_dirty:
+            # A commentary event can repeat the last draft. Check the segment
+            # that contains it instead of unrelated dirty elements in the turn.
+            stripped = text.strip()
+            last = next((seg for seg in reversed(session.segment_state.segments) if seg.cumulative and seg.text), None)
+            if stripped and last and turn.text.rstrip().endswith(stripped):
+                affected = [last]
+            else:
+                affected = self._on_thinking_segment(session, "\n\n" + text + "\n\n")
+            await session.flush.flush_now(lambda: self._do_flush(session))
+            if session.state.is_terminal or any(not seg.created or seg.dirty for seg in affected):
                 return None
-            return turn.session.card_msg_id
+            return session.card_msg_id
 
-    def _replace_text(self, turn: Turn, text: str) -> None:
-        session = turn.session
-        if text.startswith(turn.text):
-            session.segment_state.on_answer_delta(text[len(turn.text) :])
+    def _replace_text(self, turn: Turn, text: str, *, finalize: bool = False) -> None:
+        segment_state = turn.session.segment_state
+        if finalize:
+            # A final can finish a preview interrupted by tools or commentary.
+            # Render the full answer together when it spans those segments.
+            replace = text != turn.text or sum(bool(seg.text) for seg in segment_state.segments if seg.cumulative) > 1
         else:
+            replace = not text.startswith(turn.text)
+        if replace:
             # 改写已存在的元素；删除本地对象会让远端旧元素残留并重复展示
-            for seg in session.active_segments():
-                if seg.type == SegmentType.ANSWER:
+            for seg in segment_state.segments:
+                if seg.cumulative:
                     seg.text = ""
                     seg.dirty = True
-            if text:
-                session.segment_state.on_answer_delta(text)
+            delta = text
+        else:
+            delta = text[len(turn.text) :]
+        if delta:
+            segment_state.on_answer_delta(delta, cumulative=True)
         turn.text = text
 
-    async def _finish_locked(self, key: str, turn: Turn, *, aborted: bool = False, failed: bool = False) -> bool:
+    async def _finish_locked(
+        self, key: str, turn: Turn, *, aborted: bool = False, failed: bool = False, im_fallback: bool = False,
+    ) -> bool:
         turn.closing = True
         session = turn.session
         session.footer.setdefault("duration", time.time() - session.created_at)
@@ -187,7 +201,7 @@ class StreamCardController(StreamingController):
             turn.aborted = aborted
             session.state = SessionState.ABORTED if aborted else SessionState.FAILED
         try:
-            success = bool(session.card_msg_id) and await self._do_complete_card(session)
+            success = bool(session.card_msg_id) and await self._do_complete_card(session, im_fallback=im_fallback)
         except Exception:
             _logger.exception("Card completion failed")
             success = False

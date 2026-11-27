@@ -32,6 +32,7 @@ from lark_oapi.api.im.v1 import (
     CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
+    DeleteMessageRequest,
     PatchMessageRequest,
     PatchMessageRequestBody,
     ReplyMessageRequest,
@@ -86,6 +87,8 @@ class FeishuAPIError(RuntimeError):
 
 CARDKIT_RATE_LIMITED = 230020  # 频控
 CARDKIT_CONTENT_FAILED = 230099  # 卡片内容创建失败（通用码，需检查子错误）
+CARDKIT_SIZE_LIMIT = 200860
+CARDKIT_STREAMING_TIMEOUT = 200850
 CARDKIT_ELEMENT_LIMIT = 11310  # 子码: 卡片元素数量超限
 CARDKIT_SEQUENCE_CONFLICT = 300317  # 操作序号未递增
 CARDKIT_STREAMING_CLOSED = 300309  # 卡片流式模式已关闭
@@ -171,6 +174,10 @@ class FeishuClient:
         )
         await self._checked_call("update_card_message", lambda: self._client.im.v1.message.apatch(request))
 
+    async def delete_card_message(self, message_id: str) -> None:
+        request = DeleteMessageRequest.builder().message_id(message_id).build()
+        await self._checked_call("delete_card_message", lambda: self._client.im.v1.message.adelete(request))
+
     async def send_card_to_chat(
         self,
         chat_id: str,
@@ -178,9 +185,10 @@ class FeishuClient:
         *,
         reply_to_message_id: str | None = None,
         thread_id: str | None = None,
+        request_id: str | None = None,
     ) -> str:
         """向指定聊天发送卡片，可通过消息 ID 定位回复，返回 message_id."""
-        request_uuid = uuid.uuid4().hex
+        request_uuid = request_id or uuid.uuid4().hex
         if reply_to_message_id:
             request = (
                 ReplyMessageRequest.builder()
@@ -220,9 +228,9 @@ class FeishuClient:
             return str(resp.data.message_id)
         raise FeishuAPIError("send_card_to_chat: response missing message_id")
 
-    async def reply_card_by_id(self, message_id: str, card_id: str) -> str:
+    async def reply_card_by_id(self, message_id: str, card_id: str, *, request_id: str | None = None) -> str:
         """通过 card_id 回复 CardKit 卡片消息，返回 message_id."""
-        request_uuid = uuid.uuid4().hex
+        request_uuid = request_id or uuid.uuid4().hex
         request = (
             ReplyMessageRequest.builder()
             .message_id(message_id)
@@ -324,11 +332,17 @@ class FeishuClient:
         self, card_id: str, sequence: int = 0, *, request_id: str | None = None,
     ) -> None:
         """关闭 CardKit 卡片的流式模式."""
-        body_builder = SettingsCardRequestBody.builder().settings(self._dumps({"streaming_mode": False}))
+        await self.cardkit_set_streaming(card_id, False, sequence=sequence, request_id=request_id)
+
+    async def cardkit_set_streaming(
+        self, card_id: str, enabled: bool, *, sequence: int, request_id: str | None = None,
+    ) -> None:
+        settings = {"config": {"streaming_mode": enabled}}
+        body_builder = SettingsCardRequestBody.builder().settings(self._dumps(settings))
         body_builder = body_builder.sequence(sequence).uuid(request_id or uuid.uuid4().hex)
         request = SettingsCardRequest.builder().card_id(card_id).request_body(body_builder.build()).build()
         await self._checked_call(
-            "cardkit_close_streaming",
+            "cardkit_set_streaming",
             lambda: self._client.cardkit.v1.card.asettings(request),
         )
 

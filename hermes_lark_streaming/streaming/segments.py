@@ -17,6 +17,7 @@ class Segment:
 
     __slots__ = (
         "created",
+        "cumulative",
         "dirty",
         "el_id",
         "elapsed_ms",
@@ -34,6 +35,7 @@ class Segment:
         self.type = SegmentType(seg_type)
         self.el_id = el_id
         self.created = False
+        self.cumulative = False
         self.dirty = True
         self.element_estimate: int = 0
         self.text: str = ""
@@ -98,21 +100,25 @@ class SegmentState:
                 seg.elapsed_ms = (now - seg.start_time) * 1000
                 break
 
-    def on_reasoning_delta(self, text: str) -> None:
+    def on_reasoning_delta(self, text: str) -> Segment:
         """处理 reasoning 增量，同类型追加否则新建 segment."""
         if self.segments and self.segments[-1].type == SegmentType.REASONING:
             self.segments[-1].text += text
             self.segments[-1].dirty = True
-        else:
-            self._new_reasoning(text)
+            return self.segments[-1]
+        return self._new_reasoning(text)
 
-    def on_answer_delta(self, text: str) -> None:
+    def on_answer_delta(self, text: str, *, cumulative: bool = False) -> Segment:
         """处理 answer 增量，同类型追加否则新建 segment."""
-        if self.segments and self.segments[-1].type == SegmentType.ANSWER:
-            self.segments[-1].text += text
-            self.segments[-1].dirty = True
-        else:
-            self._new_answer(text)
+        if self.segments:
+            last = self.segments[-1]
+            if last.type == SegmentType.ANSWER and last.cumulative == cumulative:
+                last.text += text
+                last.dirty = True
+                return last
+        segment = self._new_answer(text)
+        segment.cumulative = cumulative
+        return segment
 
     def on_tool_event(self, tool_step_count: int) -> None:
         """处理工具调用事件，同类型标记 dirty 否则新建 segment 并终结前序 tool segment."""

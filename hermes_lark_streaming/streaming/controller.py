@@ -8,7 +8,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
-from ..cardkit.builder import build_complete_card, build_streaming_card_v2
+from httpx import TimeoutException
+
+from ..cardkit.builder import build_complete_card, build_streaming_card_v2, paginate_complete_card
 from ..cardkit.markdown import (
     _downgrade_tables,
     optimize_markdown_style,
@@ -18,7 +20,9 @@ from ..feishu import (
     CARDKIT_ELEMENT_LIMIT,
     CARDKIT_RATE_LIMITED,
     CARDKIT_SEQUENCE_CONFLICT,
+    CARDKIT_SIZE_LIMIT,
     CARDKIT_STREAMING_CLOSED,
+    CARDKIT_STREAMING_TIMEOUT,
     FeishuAPIError,
 )
 from .diagnostics import compact_ids, extract_missing_element_id, segment_state_for_log, summarize_actions
@@ -36,8 +40,9 @@ from .segment_helper import (
     tool_segment_end,
 )
 from .segments import Segment, SegmentState, SegmentType
-from .session import SessionState
+from .session import CardPage, SessionState
 from .text import split_reasoning_text
+from .unavailable_guard import is_terminal_api_code
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -72,19 +77,32 @@ class StreamingController:
     _cleanup_session: Callable[[CardSession], None]
 
     async def _cardkit_call(
-        self, session: CardSession, operation: Callable[..., Awaitable[None]], *args: Any,
+        self, target: CardSession | CardPage, operation: Callable[..., Awaitable[None]], *args: Any,
     ) -> None:
         """同一操作重用幂等 ID；仅序号冲突时递增重试，保持会话后续序号同步."""
         request_id = uuid.uuid4().hex
         for attempt in range(3):
-            session.sequence += 1
+            target.sequence += 1
             try:
-                await operation(*args, sequence=session.sequence, request_id=request_id)
+                await operation(*args, sequence=target.sequence, request_id=request_id)
                 return
             except FeishuAPIError as exc:
                 if exc.code != CARDKIT_SEQUENCE_CONFLICT or attempt == 2:
                     raise
-                _logger.warning("CardKit sequence conflict: seq=%d; retrying", session.sequence)
+                _logger.warning("CardKit sequence conflict: seq=%d; retrying", target.sequence)
+
+    async def _cardkit_preview(
+        self, session: CardSession, operation: Callable[..., Awaitable[None]], *args: Any,
+    ) -> None:
+        try:
+            await self._cardkit_call(session, operation, *args)
+        except FeishuAPIError as exc:
+            if session.state != SessionState.STREAMING or exc.code != CARDKIT_STREAMING_TIMEOUT:
+                raise
+            assert self._client is not None and session.card_id is not None
+            # CardKit can expire streaming mode while the turn and card are still active.
+            await self._cardkit_call(session, self._client.cardkit_set_streaming, session.card_id, True)
+            await self._cardkit_call(session, operation, *args)
 
     def _schedule_flush(self, session: CardSession) -> None:
         if session.state == SessionState.IDLE or session.state.is_terminal:
@@ -93,21 +111,18 @@ class StreamingController:
             return
         session.flush.schedule_update(lambda: self._do_flush(session))
 
-    def _on_thinking_segment(self, session: CardSession, text: str) -> bool:
+    def _on_thinking_segment(self, session: CardSession, text: str) -> list[Segment]:
         segment_state = session.segment_state
         split = split_reasoning_text(text)
         reasoning = split.get("reasoning_text")
         answer = split.get("answer_text")
 
-        show_reasoning = bool(reasoning) and self._cfg.show_reasoning
-        if reasoning and show_reasoning:
-            segment_state.on_reasoning_delta(reasoning)
+        affected = []
+        if reasoning and self._cfg.show_reasoning:
+            affected.append(segment_state.on_reasoning_delta(reasoning))
         if answer:
-            segment_state.on_answer_delta(answer)
-        if not show_reasoning and not answer:
-            return False
-        self._schedule_flush(session)
-        return True
+            affected.append(segment_state.on_answer_delta(answer))
+        return affected
 
     async def _do_create_card(self, session: CardSession) -> None:
         """创建只有 loading 的流式占位卡片."""
@@ -312,7 +327,7 @@ class StreamingController:
                         session.sequence + 1,
                         len(content),
                     )
-                    await self._cardkit_call(
+                    await self._cardkit_preview(
                         session, self._client.cardkit_stream_element, session.card_id,
                         seg.text_el_id,
                         content,
@@ -329,7 +344,7 @@ class StreamingController:
                         session.sequence + 1,
                         len(content),
                     )
-                    await self._cardkit_call(
+                    await self._cardkit_preview(
                         session, self._client.cardkit_stream_element, session.card_id,
                         seg.el_id,
                         content,
@@ -373,7 +388,7 @@ class StreamingController:
             for seg in updated_tool_segs
         }
         try:
-            await self._cardkit_call(
+            await self._cardkit_preview(
                 session, self._client.cardkit_batch_update, session.card_id,
                 actions,
             )
@@ -494,12 +509,10 @@ class StreamingController:
         self,
         session: CardSession,
         seal_segments: list[Segment],
-    ) -> None:
-        """关闭当前卡的流式模式并封存内容，拆卡后继续使用新卡."""
-        assert self._client is not None
-        old_card_id = session.card_id
-        if not old_card_id:
-            return
+    ) -> CardPage:
+        """关闭当前卡的流式模式并封存内容，拆卡后继续使用新卡。"""
+        assert session.card_id is not None
+        page = CardPage(session.card_id, session.card_msg_id, session.sequence)
         if session.image_resolver:
             await _resolve_answer_images(
                 seal_segments,
@@ -507,35 +520,30 @@ class StreamingController:
                 log_prefix="CardKit seal",
             )
         all_steps = session.tool_use.build_display_steps()
-        seal_card = build_complete_card(
-            segments=seal_segments,
-            all_tool_steps=all_steps,
-            footer_fields=[],
-            footer_show_label=False,
-            footer_enabled=False,
-            panel_expanded=self._cfg.panel_expanded,
-            header_enabled=False,
-            body_text_size=self._cfg.body_text_size,
-            show_tool_use=self._cfg.show_tool_use,
-            width_mode=self._cfg.width_mode,
-        )
+        seal_card = self._render_complete_card(session, seal_segments, all_steps, footer=False)
+        text_snapshot = [(seg, seg.text) for seg in seal_segments if seg.type != SegmentType.TOOL]
         try:
-            await self._cardkit_call(session, self._client.cardkit_close_streaming, old_card_id)
-            await self._cardkit_call(session, self._client.cardkit_update, old_card_id, seal_card)
+            await self._write_complete_page(page, seal_card)
+            for seg, text in text_snapshot:
+                if seg.text == text:
+                    seg.dirty = False
         except Exception:
             _logger.warning(
                 "CardKit seal failed for old card %s, continuing",
-                old_card_id[:12],
+                page.card_id[:12],
                 exc_info=True,
             )
+        return page
 
-    async def _send_card_reference(self, session: CardSession, card_id: str) -> str:
+    async def _send_card_reference(self, session: CardSession, card_id: str, *, request_id: str | None = None) -> str:
         assert self._client is not None
+        request = {"request_id": request_id} if request_id else {}
         if session.anchor_id:
-            return await self._client.reply_card_by_id(session.anchor_id, card_id)
-        topic = {"thread_id": session.thread_id} if session.thread_id else {}
+            return await self._client.reply_card_by_id(session.anchor_id, card_id, **request)
+        if session.thread_id:
+            request["thread_id"] = session.thread_id
         return await self._client.send_card_to_chat(
-            chat_id=session.chat_id, card={"type": "card", "data": {"card_id": card_id}}, **topic,
+            chat_id=session.chat_id, card={"type": "card", "data": {"card_id": card_id}}, **request,
         )
 
     async def _create_streaming_card(self, session: CardSession) -> tuple[str, str] | None:
@@ -590,7 +598,9 @@ class StreamingController:
             session.split_disabled = True  # 降级：继续写当前卡
             return True
 
-        await self._seal_current_card(session, seal_segments)
+        page = await self._seal_current_card(session, seal_segments)
+        page.sealed_through = split_idx
+        session.pages.append(page)
 
         new_card_id, new_msg_id = new_card
         session.set_card(card_id=new_card_id, card_msg_id=new_msg_id)
@@ -620,14 +630,14 @@ class StreamingController:
             if sub_code == CARDKIT_ELEMENT_LIMIT:
                 _logger.warning("CardKit card element limit exceeded")
 
-    async def _do_complete_card(self, session: CardSession) -> bool:
+    async def _do_complete_card(self, session: CardSession, *, im_fallback: bool = False) -> bool:
         """完成流式卡片：close streaming + 全量重建卡片（保持 segments 顺序）."""
         try:
-            return await self._do_complete_card_inner(session)
+            return await self._do_complete_card_inner(session, im_fallback=im_fallback)
         finally:
             self._cleanup_session(session)
 
-    async def _do_complete_card_inner(self, session: CardSession) -> bool:
+    async def _do_complete_card_inner(self, session: CardSession, *, im_fallback: bool) -> bool:
         if session.guard.should_skip("_do_complete_card"):
             return False
 
@@ -635,10 +645,7 @@ class StreamingController:
         session.flush.mark_completed()
 
         segment_state = session.segment_state
-        is_error = session.state == SessionState.FAILED
-        is_aborted = session.state == SessionState.ABORTED
         all_tool_steps = session.tool_use.build_display_steps()
-
         segment_state.finalize_segments(len(all_tool_steps))
 
         active_segments = session.active_segments()
@@ -650,70 +657,144 @@ class StreamingController:
                 log_prefix="CardKit",
             )
 
-        card = build_complete_card(
-            segments=active_segments,
+        if not session.card_id:
+            session.state = SessionState.COMPLETED
+            return True
+
+        # An authoritative final can replace a preview visible on a sealed card.
+        payloads = []
+        start = 0
+        for page in session.pages:
+            end = page.sealed_through
+            if end is None:
+                break
+            old_card = self._render_complete_card(
+                session, segment_state.segments[start:end], all_tool_steps, footer=False,
+            )
+            payloads.extend(paginate_complete_card(old_card))
+            start = end
+        card = self._render_complete_card(session, active_segments, all_tool_steps, footer=True)
+        payloads.extend(paginate_complete_card(card))
+        if not session.pages or session.pages[-1].sealed_through is not None:
+            session.pages.append(CardPage(session.card_id, session.card_msg_id, session.sequence))
+
+        if not await self._publish_final_pages(session, payloads, im_fallback=im_fallback):
+            return False
+        session.state = SessionState.COMPLETED
+        _logger.info("CardKit finalized: msg=%s pages=%d", session.message_id[:12], len(payloads))
+        return True
+
+    def _render_complete_card(
+        self, session: CardSession, segments: list[Segment], all_tool_steps: list[ToolDisplayStep], *, footer: bool,
+    ) -> dict[str, Any]:
+        return build_complete_card(
+            segments=segments,
             all_tool_steps=all_tool_steps,
             footer_data=session.footer,
-            is_error=is_error,
-            is_aborted=is_aborted,
+            is_error=session.state == SessionState.FAILED,
+            is_aborted=session.state == SessionState.ABORTED,
             footer_fields=self._cfg.footer_fields,
             footer_show_label=self._cfg.footer_show_label,
-            footer_enabled=self._cfg.footer_enabled,
+            footer_enabled=footer and self._cfg.footer_enabled,
             footer_text_size=self._cfg.footer_text_size,
             panel_expanded=self._cfg.panel_expanded,
-            header_enabled=self._cfg.header_enabled,
+            header_enabled=footer and self._cfg.header_enabled,
             body_text_size=self._cfg.body_text_size,
             show_tool_use=self._cfg.show_tool_use,
             width_mode=self._cfg.width_mode,
         )
 
-        streaming_closed = session.state == SessionState.COMPLETED
+    async def _write_complete_page(self, page: CardPage, card: dict[str, Any]) -> None:
+        if page.payload == card:
+            return
+        assert self._client is not None
+        if page.im_patched:
+            assert page.card_msg_id is not None
+            await self._client.update_card_message(page.card_msg_id, card)
+        else:
+            if not page.streaming_closed:
+                try:
+                    await self._cardkit_call(page, self._client.cardkit_close_streaming, page.card_id)
+                except FeishuAPIError as exc:
+                    if exc.code not in {CARDKIT_STREAMING_TIMEOUT, CARDKIT_STREAMING_CLOSED}:
+                        raise
+                page.streaming_closed = True
+            await self._cardkit_call(page, self._client.cardkit_update, page.card_id, card)
+        page.payload = card
+
+    async def _complete_page(
+        self, session: CardSession, page: CardPage, card: dict[str, Any], *, im_fallback: bool,
+    ) -> bool:
+        assert self._client is not None
         for attempt in range(3):
             try:
-                assert self._client is not None
-                if session.card_id:
-                    if not streaming_closed:
-                        await self._cardkit_call(session, self._client.cardkit_close_streaming, session.card_id)
-                        streaming_closed = True
-                    await self._cardkit_call(
-                        session, self._client.cardkit_update, session.card_id,
-                        card,
-                    )
-                session.state = SessionState.COMPLETED
+                await self._write_complete_page(page, card)
                 return True
-            except FeishuAPIError as e:
+            except Exception as exc:
                 _logger.warning(
-                    "CardKit complete attempt %d failed: code=%s msg=%s card_id=%s seq=%d",
-                    attempt,
-                    e.code,
-                    e,
-                    session.card_id,
-                    session.sequence,
-                    exc_info=True,
+                    "CardKit complete attempt %d failed: code=%s card=%s seq=%d",
+                    attempt, getattr(exc, "code", None), page.card_id[:12], page.sequence, exc_info=True,
                 )
-                if e.code == CARDKIT_SEQUENCE_CONFLICT or session.guard.terminate("_do_complete_card", e):
+                if session.guard.terminate("_do_complete_card", exc):
                     return False
-                if attempt < 2:
-                    await asyncio.sleep(2**attempt)
-                continue
-            except Exception as e:
-                _logger.warning(
-                    "CardKit complete attempt %d failed: %s: %s card_id=%s seq=%d",
-                    attempt,
-                    type(e).__name__,
-                    e,
-                    session.card_id,
-                    session.sequence,
-                    exc_info=True,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(2**attempt)
-                continue
+                if isinstance(exc, FeishuAPIError) and exc.code in {CARDKIT_SEQUENCE_CONFLICT, CARDKIT_SIZE_LIMIT}:
+                    break
+            if attempt < 2:
+                await asyncio.sleep(2**attempt)
 
-        _logger.error(
-            "CardKit complete failed after 3 attempts: card_id=%s seq=%d",
-            session.card_id,
-            session.sequence,
-        )
-        session.mark_failed()
-        return False
+        if not (im_fallback and page.card_msg_id) or page.im_patched:
+            session.mark_failed()
+            return False
+        # Replacing only the failed page preserves the rest of the answer.
+        try:
+            await self._client.update_card_message(page.card_msg_id, card)
+        except Exception:
+            _logger.warning("Could not update streamed message %s", page.card_msg_id[:12], exc_info=True)
+            return False
+        page.im_patched = True
+        page.payload = card
+        return True
+
+    async def _publish_final_pages(
+        self, session: CardSession, payloads: list[dict[str, Any]], *, im_fallback: bool,
+    ) -> bool:
+        assert self._client is not None
+        pages = session.pages
+        try:
+            for index, card in enumerate(payloads):
+                if index == len(pages):
+                    # Publish a complete card, and keep the reference request ID on retry.
+                    card_id = await self._client.cardkit_create(card)
+                    pages.append(CardPage(card_id, None, streaming_closed=True, payload=card, send_id=uuid.uuid4().hex))
+                page = pages[index]
+                if not await self._complete_page(session, page, card, im_fallback=im_fallback):
+                    return False
+                if page.send_id:
+                    await self._send_final_page(session, page)
+
+            while len(pages) > len(payloads):
+                page = pages[-1]
+                if page.send_id:
+                    # Recover the receipt before deleting an ambiguous continuation.
+                    await self._send_final_page(session, page)
+                if page.card_msg_id:
+                    try:
+                        await self._client.delete_card_message(page.card_msg_id)
+                    except FeishuAPIError as exc:
+                        if not is_terminal_api_code(exc.code):
+                            raise
+                pages.pop()
+        except Exception:
+            _logger.warning("Could not finish CardKit pages: msg=%s", session.message_id[:12], exc_info=True)
+            return False
+        return True
+
+    async def _send_final_page(self, session: CardSession, page: CardPage) -> None:
+        assert page.send_id is not None
+        try:
+            message_id = await self._send_card_reference(session, page.card_id, request_id=page.send_id)
+        except (TimeoutError, TimeoutException):
+            # The message might have landed. Reuse its request ID to obtain the receipt.
+            message_id = await self._send_card_reference(session, page.card_id, request_id=page.send_id)
+        page.card_msg_id = message_id
+        page.send_id = None

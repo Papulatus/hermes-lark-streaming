@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from ..streaming.segments import Segment, SegmentType
@@ -517,3 +519,70 @@ def build_static_card(content: str) -> dict[str, Any]:
         if chunk.strip():
             card["body"]["elements"].append({"tag": "markdown", "content": chunk})
     return card
+
+
+def _count_components(value: Any) -> int:
+    if isinstance(value, dict):
+        return int("tag" in value) + sum(_count_components(child) for child in value.values())
+    if isinstance(value, list):
+        return sum(_count_components(child) for child in value)
+    return 0
+
+
+def _card_fits(card: dict[str, Any]) -> bool:
+    # Feishu CardKit limits a card to 30 KB of serialized JSON and 200 components.
+    return len(json.dumps(card, ensure_ascii=False).encode()) <= 30_000 and _count_components(card) <= 200
+
+
+def _pack_elements(elements: list[dict], fits: Callable[[list[dict]], bool]) -> Iterator[list[dict]]:
+    page: list[dict] = []
+    for element in elements:
+        if page and not fits([*page, element]):
+            yield page
+            page = []
+        page.append(element)
+    if page:
+        yield page
+
+
+def paginate_complete_card(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pack rendered components without losing text or repeating the turn footer."""
+    if _card_fits(card):
+        return [card]
+
+    body = card["body"]["elements"]
+    footer = body[-2:] if len(body) >= 2 and body[-2]["tag"] == "hr" else []
+    content_elements = body[:-2] if footer else body
+
+    def with_body(elements: list[dict]) -> dict[str, Any]:
+        summary = next((e["content"][:120].replace("\n", " ") for e in elements if e["tag"] == "markdown"), "")
+        return {**card, "config": {**card["config"], "summary": {"content": summary}}, "body": {"elements": elements}}
+
+    def fits(elements: list[dict]) -> bool:
+        return _card_fits(with_body([*elements, *footer]))
+
+    elements: list[dict] = []
+    for element in content_elements:
+        if fits([element]):
+            elements.append(element)
+        elif element["tag"] == "collapsible_panel":
+            # A single reasoning panel or a batch of tool steps can fill a card.
+            children: list[dict] = []
+            for child in element["elements"]:
+                if child["tag"] == "markdown":
+                    children.extend({**child, "content": chunk} for chunk in _split_long_text(child["content"]))
+                else:
+                    children.append(child)
+            def fits_panel(group: list[dict], panel: dict = element) -> bool:
+                return fits([{**panel, "elements": group}])
+
+            for group in _pack_elements(children, fits_panel):
+                elements.append({**element, "elements": group})
+        else:
+            elements.append(element)
+
+    pages = list(_pack_elements(elements, fits))
+    if not pages:
+        return [card]
+    pages[-1].extend(footer)
+    return [with_body(page) for page in pages]
