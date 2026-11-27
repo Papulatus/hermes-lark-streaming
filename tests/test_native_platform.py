@@ -778,6 +778,55 @@ async def test_process_completion_streams_without_platform_message_id(adapter, t
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", [None, "omt_topic"])
+async def test_queued_goal_continuations_stream_without_inbound_message_id(adapter, thread_id):
+    from gateway.run_goals import GatewayGoalsMixin
+    from gateway.session_context import scoped_turn_actor
+    from gateway.session_state import TurnState
+
+    client = adapter.cards._client
+    client.cardkit_create.side_effect = ["goal-card-1", "goal-card-2"]
+    client.send_card_to_chat.side_effect = ["om_goal_1", "om_goal_2"]
+    source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u", thread_id=thread_id,
+                           message_id="om_stale_anchor")
+    foreground = MessageEvent(text="question", source=source, message_id="om_foreground")
+    turn = TurnState(event=foreground)
+    await adapter.on_processing_start(foreground)
+    set_session_vars(platform="feishu", chat_id="chat", session_key="session", turn_event=foreground)
+
+    for index in (1, 2):
+        event = GatewayGoalsMixin._synthetic_prompt_event(source, "Continue standing goal")
+        assert event.message_id is None and event.source.message_id is None and not event.internal
+        with scoped_turn_actor(event, turn):
+            consumer = GatewayStreamConsumer(
+                adapter, "chat", config=StreamConsumerConfig(transport="auto", cursor=""),
+            )
+            task = asyncio.create_task(consumer.run())
+            consumer.on_delta(f"Progress {index}")
+            assert await asyncio.to_thread(consumer.flush_pending_sync, 2)
+            assert client.cardkit_create.await_count == index
+            assert client.send_card_to_chat.call_args.kwargs.get("thread_id") == thread_id
+            consumer.finish(f"Complete goal result {index}")
+            await asyncio.wait_for(task, 2)
+        assert consumer.message_id == f"om_goal_{index}"
+        assert consumer.delivered_final_matches(f"Complete goal result {index}") is True
+        assert client.cardkit_update.call_args.args[0] == f"goal-card-{index}"
+        assert f"Complete goal result {index}" in str(client.cardkit_update.call_args)
+        assert adapter.processing_source_id("chat") == "om_foreground"
+
+    reset_session_vars()
+    result, _ = await adapter.send_final_ledgered(
+        event, "session", "Complete goal result 2", {"notify": True}, reply_to=None,
+    )
+    assert result.success and result.message_id == "om_goal_2"
+    assert client.cardkit_create.await_count == client.cardkit_close_streaming.await_count == 2
+    assert client.cardkit_update.await_count == client.send_card_to_chat.await_count == 2
+    client.reply_card_by_id.assert_not_awaited()
+    assert not adapter.cards.turns
+    await adapter.on_processing_complete(foreground, ProcessingOutcome.SUCCESS)
+
+
+@pytest.mark.asyncio
 async def test_silent_internal_heartbeat_does_not_create_empty_card(adapter):
     source = SessionSource(platform=Platform.FEISHU, chat_id="chat", user_id="u")
     event = MessageEvent(text="still running", source=source, internal=True,

@@ -10,6 +10,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from sys import maxsize
 from typing import Any, cast
+from uuid import uuid4
 
 from gateway import session_context
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
@@ -31,6 +32,7 @@ class CardObservations:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     streaming: bool = False
     waiting_for_text: bool = False
+    source_id: str = ""
 
 
 class FeishuStreamingAdapter(builtin.FeishuAdapter):
@@ -76,18 +78,31 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         await super().handle_message(event)
 
     @staticmethod
-    def _internal_event(chat_id: str) -> MessageEvent | None:
-        # A producer event has its own identity even when its source has no reply anchor.
+    def _synthetic_event(chat_id: str) -> MessageEvent | None:
         bound_event = getattr(session_context, "_SESSION_TURN_EVENT", None)
         event = bound_event.get() if bound_event is not None else None
-        if isinstance(event, MessageEvent) and event.internal and event.source.chat_id == chat_id:
+        if not isinstance(event, MessageEvent) or getattr(event.source, "chat_id", None) != chat_id:
+            return None
+        # Goal continuations retain channel inputs and still pass normal user authorization.
+        if event.internal or (getattr(event, "inherit_channel_pin", False) and not event.message_id):
             return event
         return None
 
+    @staticmethod
+    def _synthetic_observations(event: MessageEvent) -> CardObservations:
+        observations = getattr(event, "_cheerwhy_card_observations", None)
+        if observations is None:
+            # Keep the generated key on the event without making it a Feishu reply anchor.
+            observations = vars(event).setdefault(
+                "_cheerwhy_card_observations",
+                CardObservations(waiting_for_text=True, source_id=event.message_id or f"synthetic:{uuid4().hex}"),
+            )
+        return cast(CardObservations, observations)
+
     def processing_source_id(self, chat_id: str) -> str:
-        internal = self._internal_event(chat_id)
-        if internal is not None:
-            return str(internal.message_id or "")
+        synthetic = self._synthetic_event(chat_id)
+        if synthetic is not None:
+            return self._synthetic_observations(synthetic).source_id
         stack = self._processing_sources.get()
         if stack:
             source_chat, source_id = stack[-1]
@@ -98,15 +113,11 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         return str(get_session_env("HERMES_SESSION_MESSAGE_ID") or "")
 
     def _card_observations(self, chat_id: str, source_id: str, *, create: bool = False) -> CardObservations | None:
-        event = self._internal_event(chat_id)
-        if event is not None and event.message_id == source_id:
-            # The authority executes synthetic turns without processing hooks. The event
-            # owns its buffer so silent turns need no adapter cleanup.
-            observations = getattr(event, "_cheerwhy_card_observations", None)
-            if observations is None:
-                observations = CardObservations(waiting_for_text=True)
-                vars(event)["_cheerwhy_card_observations"] = observations
-            return cast(CardObservations, observations)
+        event = self._synthetic_event(chat_id)
+        if event is not None:
+            observations = self._synthetic_observations(event)
+            if observations.source_id == source_id:
+                return observations
         route = (chat_id, source_id)
         return self._observations.setdefault(route, CardObservations()) if create else self._observations.get(route)
 
@@ -166,11 +177,11 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
     async def _card_frame(
         self, source_id: str, chat_id: str, content: str, *, reply_to: str | None = None,
     ) -> bool:
-        internal = self._internal_event(chat_id)
+        synthetic = self._synthetic_event(chat_id)
         return await self.cards.frame(
             source_id, chat_id, content, source_id=source_id,
-            reply_to=None if internal else self._card_routes.get((chat_id, source_id), reply_to),
-            thread_id=internal.source.thread_id if internal else None,
+            reply_to=None if synthetic else self._card_routes.get((chat_id, source_id), reply_to),
+            thread_id=synthetic.source.thread_id if synthetic else None,
             session_key=get_session_env("HERMES_SESSION_KEY"),
         )
 
@@ -211,9 +222,10 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
         reply_to: str | None, is_ephemeral_response: bool = False,
     ) -> tuple[SendResult, BasePlatformAdapter]:
-        # The base adapter still owns the durable delivery ledger. Carry the precise
-        # inbound ID across the boundary where the agent's context has been reset.
+        # The base adapter owns the ledger. Keep the card's turn identity after context reset.
         source_id = event.ledger_message_id or event.message_id
+        if not source_id and (observations := getattr(event, "_cheerwhy_card_observations", None)) is not None:
+            source_id = observations.source_id
         result = await super().send_final_ledgered(
             event, session_key, text_content, {**metadata, "_card_source_id": source_id},
             reply_to=reply_to, is_ephemeral_response=is_ephemeral_response,
